@@ -179,6 +179,23 @@ def _collect_layer_forward_progress(
     return batch_count, forward_row_counts, forward_total_rows
 
 
+def _clear_inline_forward_hooks(*module_roots: torch.nn.Module) -> None:
+    """Remove subset capture hooks so a full-layer replay can finish without StopForward."""
+    seen: set[int] = set()
+    for root in module_roots:
+        if root is None:
+            continue
+        for submodule in root.modules():
+            module_id = id(submodule)
+            if module_id in seen:
+                continue
+            seen.add(module_id)
+            if hasattr(submodule, "forward_hook"):
+                submodule.forward_hook = None
+            if hasattr(submodule, "forward_hook_last"):
+                submodule.forward_hook_last = False
+
+
 def _collect_hook_skip_modules(planning_layer_modules: List[List[str]]) -> set[str]:
     """Collect module paths flagged as non-quantized in module-tree planning blocks."""
 
@@ -656,7 +673,15 @@ def run_layer_stage(
             )
 
             if replay_skipped_layer or replay_after_process:
-                # Pass `replay_plan` through unconditionally: the helper uses
+                # Subset forwards may leave inline HookedLinear/Conv1D hooks attached.
+                # Clear them before the untouched replay that feeds the next layer.
+                _clear_inline_forward_hooks(module)
+                replay_metadata_plan = replay_plan
+                if replay_after_process and replay_plan is not None:
+                    # Keep batch/row progress metadata but do not reuse subset modules
+                    # or per-subset device overrides during the full-layer replay.
+                    replay_metadata_plan = replay_plan.for_modules({})
+                # Pass `replay_metadata_plan` through unconditionally: the helper uses
                 # subset metadata when available and falls back to generic
                 # untouched-layer replay when it is `None`.
                 layer_outputs = _replay_layer_outputs(
@@ -675,8 +700,14 @@ def run_layer_stage(
                     full=full,
                     log=log,
                     region_timer=region_timer,
-                    replay_plan=replay_plan,
+                    replay_plan=replay_metadata_plan,
                 )
+                if not is_last_module and not layer_outputs:
+                    raise ValueError(
+                        f"Layer `{layer_descriptor}` replay produced no outputs after clearing "
+                        f"subset hooks (layer_inputs={len(layer_inputs)} batches). "
+                        f"Cannot advance calibration activations to the next layer."
+                    )
 
             # Finalize module after last processor
             if p_index == len(looper.processors) - 1:
@@ -703,11 +734,6 @@ def run_layer_stage(
                     region_timer.flush()
 
             if execution_config.fwd_replay_after_process:
-                if not is_last_module and not layer_outputs:
-                    raise ValueError(
-                        f"Layer `{layer_descriptor}` replay produced no outputs; "
-                        f"cannot advance calibration activations to the next layer."
-                    )
                 if layer_outputs:
                     processor.clear_cache_data()
                     processor.receive_layer_inputs(layer_outputs)
