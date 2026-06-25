@@ -1095,22 +1095,13 @@ class BaseQModel(nn.Module):
                 ParoQuantProcessor(**paro_args),
             ]
         else:
-            from ..looper.gptq_processor import GPTQProcessor
+            from ..looper.processor_args import build_gpt_quantizer_processors, native_processor_kwargs
 
-            if getattr(self.quantize_config, "uses_ptq_transform_pipeline", None) and self.quantize_config.uses_ptq_transform_pipeline():
-                from ..looper.statistics_processor import StatisticsProcessor
-                from ..looper.transform_processor import TransformProcessor
-
-                ptq_args = dict(args)
-                quantize_processor = preprocessors + [
-                    StatisticsProcessor(**ptq_args),
-                    TransformProcessor(**ptq_args),
-                    GPTQProcessor(**args),
-                ]
-            else:
-                quantize_processor = preprocessors + [
-                    GPTQProcessor(**args),
-                ]
+            quantize_processor = build_gpt_quantizer_processors(
+                self.quantize_config,
+                args,
+                preprocessors,
+            )
 
         if getattr(self.quantize_config, "gptaq", None) is not None:
             from ..looper.native_processor import NativeProcessor
@@ -1119,7 +1110,7 @@ class BaseQModel(nn.Module):
             args_clone = copy.deepcopy(args_to_copy)
             args_clone["prepare_dataset_func"] = args["prepare_dataset_func"]
 
-            args_clone.pop("calculate_w_wq_diff", None)
+            args_clone = native_processor_kwargs(args_clone)
             quantize_processor.insert(0, NativeProcessor(**args_clone))
 
         if getattr(self.quantize_config, "foem", None) is not None:
@@ -1130,7 +1121,7 @@ class BaseQModel(nn.Module):
                 args_clone = copy.deepcopy(args_to_copy)
                 args_clone["prepare_dataset_func"] = args["prepare_dataset_func"]
 
-                args_clone.pop("calculate_w_wq_diff", None)
+                args_clone = native_processor_kwargs(args_clone)
                 quantize_processor.insert(0, NativeProcessor(**args_clone))
 
         processors = quantize_processor

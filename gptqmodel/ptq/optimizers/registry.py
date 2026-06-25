@@ -6,10 +6,13 @@ from __future__ import annotations
 from ..config import WeightQuantizeTargetConfig
 from ..protocols import WeightOptimizerBackend
 from .gptq import GptqWeightOptimizer
+from .rtn import RtnWeightOptimizer
 
 
 def build_weight_optimizer(cfg: WeightQuantizeTargetConfig, qcfg) -> WeightOptimizerBackend:
     method = str(cfg.method).strip().lower()
     if method in {"gptq", "gptaq", "foem"}:
         return GptqWeightOptimizer(qcfg=qcfg, target=cfg)
+    if method == "rtn":
+        return RtnWeightOptimizer(qcfg=qcfg, target=cfg)
     raise ValueError(f"Unsupported weight optimizer `{cfg.method}`.")

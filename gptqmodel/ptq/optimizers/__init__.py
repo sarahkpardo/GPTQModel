@@ -3,5 +3,6 @@
 
 from .gptq import GptqWeightOptimizer
 from .registry import build_weight_optimizer
+from .rtn import RtnWeightOptimizer
 
-__all__ = ["GptqWeightOptimizer", "build_weight_optimizer"]
+__all__ = ["GptqWeightOptimizer", "RtnWeightOptimizer", "build_weight_optimizer"]

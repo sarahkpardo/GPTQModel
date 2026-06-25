@@ -3086,6 +3086,10 @@ class GPTQConfig(PreProcessorConfig):
         default=None,
         metadata={"help": "Export/runtime target for quantized modules (format, impl)"},
     )
+    weight_quantize: Optional[Union[Dict[str, Any], Any]] = field(
+        default=None,
+        metadata={"help": "Weight quantizer selection (method: gptq, rtn, ...)"},
+    )
 
     def allowed_quant_methods(self) -> Tuple[METHOD, ...]:
         return (METHOD.GPTQ,)
@@ -3147,7 +3151,7 @@ class GPTQConfig(PreProcessorConfig):
             self.act_group_aware = False
 
     def _normalize_ptq_pipeline_fields(self) -> None:
-        from ..ptq.config import ExportTargetConfig, normalize_transform_prepare
+        from ..ptq.config import ExportTargetConfig, WeightQuantizeTargetConfig, normalize_transform_prepare, resolve_weight_quantize_target
 
         if self.weight_prepare is not None:
             self.weight_prepare = normalize_transform_prepare(self.weight_prepare)
@@ -3163,6 +3167,9 @@ class GPTQConfig(PreProcessorConfig):
                     if k not in {"format", "impl"}
                 },
             )
+        if self.weight_quantize is not None:
+            resolved = resolve_weight_quantize_target(self)
+            self.weight_quantize = resolved
 
     def uses_ptq_transform_pipeline(self) -> bool:
         return bool(self.weight_prepare)

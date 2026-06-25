@@ -72,6 +72,26 @@ def normalize_transform_prepare(
     raise ValueError("GPTQConfig: `weight_prepare` must be a dict, list, or TransformPrepareConfig.")
 
 
+def resolve_weight_quantize_target(qcfg) -> WeightQuantizeTargetConfig:
+    """Resolve the weight quantizer target from a QuantizeConfig."""
+    raw = getattr(qcfg, "weight_quantize", None)
+    if raw is None:
+        method = "gptq"
+        if getattr(qcfg, "gptaq", None) is not None:
+            method = "gptaq"
+        elif getattr(qcfg, "foem", None) is not None:
+            method = "foem"
+        return WeightQuantizeTargetConfig(method=method)
+    if isinstance(raw, WeightQuantizeTargetConfig):
+        return raw
+    if isinstance(raw, dict):
+        payload = dict(raw)
+        method = str(payload.pop("method", "gptq")).strip().lower()
+        hessian = payload.pop("hessian", None)
+        return WeightQuantizeTargetConfig(method=method, hessian=hessian, options=payload)
+    raise ValueError("GPTQConfig: `weight_quantize` must be a dict or WeightQuantizeTargetConfig.")
+
+
 def paro_prepare_from_config(paro, *, mode: str = "standalone") -> TransformPrepareConfig:
     """Build a transform prepare entry from an existing ParoConfig."""
     return TransformPrepareConfig(

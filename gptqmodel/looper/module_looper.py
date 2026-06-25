@@ -29,6 +29,7 @@ import torch.nn as nn
 from ..looper.dequantize_processor import DequantizeProcessor
 from ..looper.eora_processor import EoraProcessor
 from ..looper.gptq_processor import GPTQProcessor
+from ..looper.quantizer_processor import QuantizerProcessor
 from ..looper.input_cache import InputCache
 from ..looper.loop_processor import LoopProcessor
 from ..looper.named_module import NamedModule
@@ -1454,7 +1455,7 @@ class ModuleLooper():
                     uses_ptq = uses_ptq()
                 if isinstance(processor, EoraProcessor) or\
                         isinstance(processor, TransformProcessor) or\
-                        (isinstance(processor, GPTQProcessor) and uses_ptq) or\
+                        (isinstance(processor, QuantizerProcessor) and uses_ptq) or\
                         (isinstance(processor, GPTQProcessor) and getattr(self.gptq_model.quantize_config, "gptaq", None) is not None) or\
                         (isinstance(processor, GPTQProcessor) and getattr(self.gptq_model.quantize_config, "foem", None) is not None):
                     prev_processor = self.processors[p_index - 1]
@@ -1587,7 +1588,7 @@ class ModuleLooper():
             for index, reverse_p in enumerate(reversed_processors, start=1):
                 # Finalize processors in reverse order
                 self._check_loop_stop()
-                if isinstance(reverse_p, GPTQProcessor):
+                if isinstance(reverse_p, (GPTQProcessor, QuantizerProcessor)):
                     pass
                 elif isinstance(reverse_p, EoraProcessor):
                     pass
@@ -1672,7 +1673,7 @@ class ModuleLooper():
             elif capture_only_flags.get(name, False):
                 subset[name].state["capture_only"] = True
 
-            if isinstance(processor, GPTQProcessor):
+            if isinstance(processor, (GPTQProcessor, QuantizerProcessor)):
                 processor.preprocess(subset[name], fallback=fallback)
             else:
                 processor.preprocess(subset[name])
