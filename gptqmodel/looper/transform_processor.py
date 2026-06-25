@@ -13,11 +13,10 @@ from ..looper.loop_processor import ExecutionConfig, LoopProcessor
 from ..looper.named_module import NamedModule
 from ..looper.statistics_processor import PTQ_CONTEXT_KEY
 from ..models import BaseQModel
-from ..ptq.config import TransformPrepareConfig, normalize_transform_prepare
+from ..ptq.config import TransformPrepareConfig, normalize_transform_prepare, resolve_calibration_nsamples
 from ..ptq.context import ModuleCalibContext, TransformState
 from ..ptq.transforms.registry import build_transform_backend
 from ..quantization.config import QuantizeConfig
-from ..quantization.gptq import get_number_of_rows_and_cols
 from ..utils.device import get_device
 
 PTQ_TRANSFORM_KEY = "ptq_transform_state"
@@ -56,6 +55,11 @@ class TransformProcessor(LoopProcessor):
         self.prepare_configs = normalize_transform_prepare(
             prepare_configs or getattr(qcfg, "weight_prepare", None)
         )
+        self.preserve_batch_keep_mask = True
+
+    def set_calibration_dataset(self, calibration_dataset):
+        self.calibration_dataset = calibration_dataset
+        self.total_calibration_tokens = LoopProcessor._compute_total_tokens(calibration_dataset)
 
     def preprocess(self, module: NamedModule, **kwargs):
         del kwargs
@@ -92,12 +96,16 @@ class TransformProcessor(LoopProcessor):
         if not self.prepare_configs:
             return
         ctx: ModuleCalibContext | None = module.state.get(PTQ_CONTEXT_KEY)
+        expected_nsamples = resolve_calibration_nsamples(self.qcfg, self)
         if ctx is None:
-            rows, columns = get_number_of_rows_and_cols(module)
-            ctx = ModuleCalibContext(
-                module_name=module.full_name,
-                columns=columns,
-                rows=rows,
+            raise ValueError(
+                f"Transform stage missing calibration context for `{module.full_name}` "
+                f"(configured nsamples={expected_nsamples})."
+            )
+        if ctx.nsamples <= 0:
+            raise ValueError(
+                f"Transform stage received empty calibration statistics for `{module.full_name}` "
+                f"(observed nsamples={ctx.nsamples}, configured nsamples={expected_nsamples})."
             )
 
         weight = module.weight.data
@@ -135,6 +143,7 @@ class TransformProcessor(LoopProcessor):
         module.state[PTQ_TRANSFORM_KEY] = transform_state
         module.state.pop("_ptq_prepare_pending", None)
         ctx.transform = transform_state
+        module.state[PTQ_CONTEXT_KEY] = ctx
 
     def submodule_finalize(self, module: NamedModule, model: BaseQModel, **kwargs):
         del module, model, kwargs

@@ -12,6 +12,7 @@ from torch.nn import Module
 from ..looper.loop_processor import ExecutionConfig, LoopProcessor
 from ..looper.named_module import NamedModule
 from ..models import BaseQModel
+from ..ptq.config import resolve_calibration_nsamples
 from ..ptq.stats import StatisticsCollector
 from ..quantization.config import QuantizeConfig
 from ..quantization.gptq import get_number_of_rows_and_cols
@@ -51,6 +52,7 @@ class StatisticsProcessor(LoopProcessor):
         )
         super().__init__(**kwargs)
         self._collectors: Dict[str, StatisticsCollector] = {}
+        self.preserve_batch_keep_mask = True
 
     def preprocess(self, module: NamedModule, **kwargs):
         del kwargs
@@ -69,14 +71,33 @@ class StatisticsProcessor(LoopProcessor):
     def is_skipped(self, module: NamedModule) -> bool:
         return module.name not in self._collectors
 
+    def has_captured_input_ids(self, name: str) -> bool:
+        collector = self._collectors.get(name)
+        return collector is not None and collector.nsamples > 0
+
     def pre_process_fwd_hook(self, name: str) -> Callable[[Module, Tuple[torch.Tensor, ...], torch.Tensor], None]:
-        def hook(_module, inp, _out):
+        def hook(_module, inp: Tuple[torch.Tensor, ...], _out: torch.Tensor):
             collector = self._collectors.get(name)
-            if collector is None:
+            if collector is None or not inp:
                 return
-            if not inp:
-                return
-            collector.add_batch(inp[0].detach())
+
+            inp_tensor = inp[0]
+            keep_mask = getattr(getattr(self, "_mask_tls", None), "value", None)
+
+            if (
+                torch.is_tensor(inp_tensor)
+                and torch.is_tensor(keep_mask)
+                and inp_tensor.dim() >= 3
+                and keep_mask.ndim == 2
+                and keep_mask.shape[:2] == inp_tensor.shape[:2]
+            ):
+                for sample_index, sample_keep in enumerate(keep_mask):
+                    if not bool(sample_keep.any().item()):
+                        continue
+                    sample_inp = inp_tensor[sample_index : sample_index + 1, sample_keep, :].contiguous()
+                    collector.add_batch(sample_inp.detach())
+            else:
+                collector.add_batch(inp_tensor.detach())
 
         return hook
 
@@ -95,6 +116,13 @@ class StatisticsProcessor(LoopProcessor):
             return
         rows, _ = get_number_of_rows_and_cols(module)
         ctx = collector.to_context(module_name=module.full_name, rows=rows)
+        expected_nsamples = resolve_calibration_nsamples(self.qcfg, self)
+        if ctx.nsamples <= 0:
+            raise ValueError(
+                f"Statistics capture collected 0 activation rows for `{module.full_name}` "
+                f"(configured nsamples={expected_nsamples}). Ensure the module receives "
+                f"calibration forwards before PTQ quantization."
+            )
         module.state[PTQ_CONTEXT_KEY] = ctx
 
     def submodule_finalize(self, module: NamedModule, model: BaseQModel, **kwargs):

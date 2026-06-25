@@ -1208,6 +1208,10 @@ class HessianConfig:
         default=2048,
         metadata={"help": "Maximum activation rows retained on CPU for transform optimization"},
     )
+    nsamples: int = field(
+        default=64,
+        metadata={"help": "Target calibration activation rows expected per module for GPTQ/PTQ Hessian capture"},
+    )
 
     def __post_init__(self):
         """Validate Hessian chunking and staging dtype settings."""
@@ -1237,6 +1241,11 @@ class HessianConfig:
                 raise ValueError("HessianConfig: `row_buffer_max_rows` must be an integer or None.")
             if self.row_buffer_max_rows < 0:
                 raise ValueError("HessianConfig: `row_buffer_max_rows` must be non-negative.")
+
+        if not isinstance(self.nsamples, int):
+            raise ValueError("HessianConfig: `nsamples` must be an integer.")
+        if self.nsamples <= 0:
+            raise ValueError("HessianConfig: `nsamples` must be a positive integer.")
 
         if isinstance(self.staging_dtype, str):
             self.staging_dtype = self.staging_dtype.lower()
@@ -3200,6 +3209,7 @@ class GPTQConfig(PreProcessorConfig):
             "staging_dtype": str(self.hessian.staging_dtype).split(".")[-1],
             "factorization": self.hessian.factorization,
             "row_buffer_max_rows": self.hessian.row_buffer_max_rows,
+            "nsamples": self.hessian.nsamples,
         }
         if self.weight_prepare:
             meta_payload["weight_prepare"] = [

@@ -68,3 +68,4 @@ def test_native_processor_kwargs_strips_quantizer_flags():
     }
     native = mod.native_processor_kwargs(args)
     assert "calculate_w_wq_diff" not in native
+
