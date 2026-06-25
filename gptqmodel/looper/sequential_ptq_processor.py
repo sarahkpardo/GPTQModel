@@ -75,7 +75,6 @@ class SequentialPTQProcessor(QuantizerProcessor):
             weight_quantize=weight_quantize,
             capture_mode="none",
         )
-        self.capture_mode = "sequential"  # type: ignore[assignment]
         self.execution_config = ExecutionConfig(
             require_fwd=True,
             fwd_replay_after_process=True,
@@ -123,6 +122,14 @@ class SequentialPTQProcessor(QuantizerProcessor):
 
     def is_skipped(self, module: NamedModule) -> bool:
         return module.name not in self._split_modules
+
+    def has_captured_input_ids(self, name: str) -> bool:
+        if name not in self._split_modules:
+            return False
+        for key, collector in self._collectors.items():
+            if key == name or key.endswith(f".{name}"):
+                return collector.nsamples > 0
+        return False
 
     def pre_process_fwd_hook(self, name: str) -> Callable[[Module, Tuple[torch.Tensor, ...], torch.Tensor], None]:
         def hook(_module, inp: Tuple[torch.Tensor, ...], _out: torch.Tensor):

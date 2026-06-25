@@ -947,6 +947,15 @@ def _run_single_subset_pass(
                 task_map = getattr(processor, "tasks", None)
                 if task_map is not None:
                     task_map.pop(name, None)
+                split_modules = getattr(processor, "_split_modules", None)
+                if isinstance(split_modules, dict):
+                    split_modules.pop(name, None)
+                collectors = getattr(processor, "_collectors", None)
+                collectors_by_id = getattr(processor, "_collectors_by_module_id", None)
+                if isinstance(collectors, dict):
+                    collectors.pop(skipped_module.full_name, None)
+                if isinstance(collectors_by_id, dict):
+                    collectors_by_id.pop(id(skipped_module.module), None)
 
                 # No calibration data was routed to these MoE expert modules.
                 # We skip quantization them and record them in `qcfg.dynamic` as dynamically excluded modules.
@@ -965,6 +974,9 @@ def _run_single_subset_pass(
         # the worker pool; otherwise freeze it on the current device.
         task_map = getattr(processor, "tasks", None)
         has_task = bool(task_map and task_map.get(name) is not None)
+        if not has_task:
+            split_modules = getattr(processor, "_split_modules", None)
+            has_task = bool(isinstance(split_modules, dict) and name in split_modules)
 
         if has_task:
             target_device = looper._prepare_named_module_for_quantization(

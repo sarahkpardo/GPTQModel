@@ -58,13 +58,20 @@ def _tensor_fingerprint(t: Optional[torch.Tensor]) -> str:
     return f"shape={tuple(t.shape)} norm={flat.norm().item():.6f} sha256={digest}"
 
 
+def _linear_out(batch: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """Run a detached linear forward with non-inference tensors for GPTQ capture."""
+    batch = batch.detach().clone()
+    weight = weight.detach().clone()
+    return F.linear(batch, weight)
+
+
 def _capture_inline(module: nn.Linear, batches: list[torch.Tensor], qcfg: QuantizeConfig) -> ModuleCalibContext:
     gptq = GPTQ(module, qcfg=qcfg)
     gptq.fallback = None
     gptq.quantizer.configure(perchannel=True)
     for batch in batches:
-        out = F.linear(batch, module.weight)
-        gptq.add_batch(batch, out)
+        out = _linear_out(batch, module.weight)
+        gptq.add_batch(batch.detach().clone(), out)
     gptq.finalize_hessian()
     return ModuleCalibContext(
         module_name=getattr(module, "full_name", "module"),
@@ -83,7 +90,7 @@ def _capture_collector(module: nn.Linear, batches: list[torch.Tensor], qcfg: Qua
         row_buffer_max_rows=qcfg.hessian.row_buffer_max_rows,
     )
     for batch in batches:
-        collector.add_batch(batch)
+        collector.add_batch(batch.detach().clone())
     ctx = collector.to_context(
         module_name=getattr(module, "full_name", "module"),
         rows=module.out_features,
@@ -98,16 +105,16 @@ def _sequential_fc2_batches(model: _TwoLinearChain, batches: list[torch.Tensor],
     inline_fc1.fallback = None
     inline_fc1.quantizer.configure(perchannel=True)
     for batch in batches:
-        out = F.linear(batch, model.fc1.weight)
-        inline_fc1.add_batch(batch, out)
+        out = _linear_out(batch, model.fc1.weight)
+        inline_fc1.add_batch(batch.detach().clone(), out)
     wq, *_ = inline_fc1.quantize(blocksize=128)
     inline_fc1.free()
-    model.fc1.weight.data = wq
+    model.fc1.weight.data = wq.detach().clone()
 
     fc2_batches = []
-    with torch.inference_mode():
+    with torch.no_grad():
         for batch in batches:
-            fc2_batches.append(F.relu(F.linear(batch, model.fc1.weight)))
+            fc2_batches.append(F.relu(_linear_out(batch, model.fc1.weight)))
     return fc2_batches
 
 
