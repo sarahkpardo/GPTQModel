@@ -44,3 +44,23 @@ def test_build_weight_optimizer_supports_rtn():
     target = WeightQuantizeTargetConfig(method="rtn")
     optimizer = build_weight_optimizer(target, FakeCfg())
     assert optimizer.__class__.__name__ == "RtnWeightOptimizer"
+    assert optimizer.requires_calibration is False
+
+
+def test_build_weight_optimizer_gptq_requires_calibration():
+    class FakeCfg:
+        bits = 4
+        sym = True
+        group_size = 128
+        format = None
+        device = None
+        smooth = None
+        damp_percent = 0.01
+        desc_act = False
+        dynamic = None
+        pack_dtype = None
+
+    target = WeightQuantizeTargetConfig(method="gptq")
+    optimizer = build_weight_optimizer(target, FakeCfg())
+    assert optimizer.__class__.__name__ == "GptqWeightOptimizer"
+    assert optimizer.requires_calibration is True

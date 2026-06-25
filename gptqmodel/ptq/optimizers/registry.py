@@ -8,6 +8,13 @@ from ..protocols import WeightOptimizerBackend
 from .gptq import GptqWeightOptimizer
 from .rtn import RtnWeightOptimizer
 
+CALIBRATION_REQUIRED_METHODS = frozenset({"gptq", "gptaq", "foem"})
+
+
+def weight_optimizer_requires_calibration(cfg: WeightQuantizeTargetConfig) -> bool:
+    """Return whether the selected weight optimizer needs calibration statistics."""
+    return str(cfg.method).strip().lower() in CALIBRATION_REQUIRED_METHODS
+
 
 def build_weight_optimizer(cfg: WeightQuantizeTargetConfig, qcfg) -> WeightOptimizerBackend:
     method = str(cfg.method).strip().lower()

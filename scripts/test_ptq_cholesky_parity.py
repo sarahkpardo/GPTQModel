@@ -147,6 +147,8 @@ def _run_ptq_split_gptq(
     *,
     blocksize: int,
 ) -> QuantResult:
+    from gptqmodel.ptq.optimizers.gptq import GptqWeightOptimizer
+
     rows, columns = named.module.weight.shape
     collector = StatisticsCollector(
         columns=columns,
@@ -174,21 +176,23 @@ def _run_ptq_split_gptq(
     ctx.transform = transform_state
     collector.free()
 
-    gptq = GPTQ(named, qcfg=qcfg)
-    gptq.quantizer.configure(perchannel=True)
-    for batch in calib:
-        out = F.linear(batch, named.module.weight)
-        gptq.add_batch(batch, out)
-    qweight, scales, zeros, g_idx, _duration, avg_loss, _damp, _nsamples = gptq.quantize(
-        blocksize=blocksize,
+    optimizer = GptqWeightOptimizer(qcfg=qcfg)
+    split = optimizer.optimize(
+        module=named,
+        ctx=ctx,
+        transform=transform_state,
+        device=named.module.weight.device,
+        qcfg=qcfg,
     )
-    gptq.free()
+    backend = split.extra.get("gptq")
+    if backend is not None:
+        backend.free()
     return QuantResult(
-        qweight=qweight.detach().cpu(),
-        scales=scales.detach().cpu(),
-        zeros=zeros.detach().cpu(),
-        g_idx=g_idx.detach().cpu(),
-        avg_loss=float(avg_loss),
+        qweight=split.pack_weight.detach().cpu(),
+        scales=split.q_scales.detach().cpu(),
+        zeros=split.q_zeros.detach().cpu(),
+        g_idx=split.q_g_idx.detach().cpu(),
+        avg_loss=float(split.extra.get("loss", 0.0)),
     )
 
 

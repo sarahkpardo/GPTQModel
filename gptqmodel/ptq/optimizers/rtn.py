@@ -34,6 +34,8 @@ def rtn_config_from_qcfg(qcfg) -> RTNConfig:
 class RtnWeightOptimizer:
     """Weight-only RTN quantizer for protocol-aligned PTQ pipelines."""
 
+    requires_calibration = False
+
     def __init__(self, *, qcfg, target: Optional[WeightQuantizeTargetConfig] = None) -> None:
         del target
         self.qcfg = qcfg

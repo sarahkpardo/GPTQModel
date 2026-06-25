@@ -30,7 +30,7 @@ from ..models.writer import (
     QUANT_LOG_NSAMPLES,
 )
 from ..ptq.config import WeightQuantizeTargetConfig, resolve_weight_quantize_target
-from ..ptq.optimizers.registry import build_weight_optimizer
+from ..ptq.optimizers.registry import build_weight_optimizer, weight_optimizer_requires_calibration
 from ..quantization import FOEM, GPTAQ, GPTQ
 from ..quantization.config import FOEMConfig, GPTAQConfig, HessianConfig, METHOD, QuantizeConfig, resolve_quant_format
 from ..utils.device import get_device
@@ -141,7 +141,7 @@ class QuantizerProcessor(LoopProcessor):
             batch_size=batch_size,
             execution_config=ExecutionConfig(
                 require_fwd=require_fwd if inline else False,
-                fwd_replay_after_process=inline,
+                fwd_replay_after_process=True,
                 subset_forward_early_stop=inline,
             ),
         )
@@ -180,8 +180,8 @@ class QuantizerProcessor(LoopProcessor):
             tmp = FOEM(module=module, qcfg=qcfg_clone)
         else:
             tmp = GPTQ(module=module, qcfg=qcfg_clone)
-            tmp.fallback = qcfg_clone.fallback
-            tmp.expected_nsamples = getattr(self, "total_calibration_tokens", None)
+        tmp.fallback = None
+        tmp.expected_nsamples = getattr(self, "total_calibration_tokens", None)
 
         tmp.quantizer.configure(perchannel=True)
         self.tasks[module.name] = tmp
@@ -253,6 +253,13 @@ class QuantizerProcessor(LoopProcessor):
         if ctx is None:
             raise ValueError(f"PTQ split pipeline missing calibration context for `{module.full_name}`.")
 
+        if weight_optimizer_requires_calibration(self.weight_quantize):
+            if ctx.nsamples <= 0:
+                raise ValueError(
+                    f"Quantizer `{self.weight_quantize.method}` requires calibration statistics "
+                    f"for `{module.full_name}`, but observed nsamples={ctx.nsamples}."
+                )
+
         transform = module.state.get(PTQ_TRANSFORM_KEY)
         opt_device = device or get_device(module.module)
         if opt_device is None:
@@ -264,6 +271,8 @@ class QuantizerProcessor(LoopProcessor):
             ctx=ctx,
             transform=transform,
             device=opt_device,
+            qcfg=self.qcfg_dynamic or self.qcfg,
+            expected_nsamples=getattr(self, "total_calibration_tokens", None),
         )
         duration = time.perf_counter() - start
 
@@ -348,6 +357,11 @@ class QuantizerProcessor(LoopProcessor):
                     f"NPU thread context {current_npu_device} does not match expected device {expected_device} "
                     f"while processing '{module.full_name}'."
                 )
+
+        if g.nsamples <= 0:
+            raise ValueError(
+                f"GPTQ quantizer requires calibration samples for `{module.full_name}`, observed 0."
+            )
 
         wq, q_scales, q_zeros, q_g_idx, duration, avg_loss, damp_percent, nsamples = g.quantize()
 
