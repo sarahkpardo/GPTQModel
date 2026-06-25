@@ -70,7 +70,12 @@ class StatisticsProcessor(LoopProcessor):
         )
         super().__init__(**kwargs)
         self._collectors: Dict[str, StatisticsCollector] = {}
+        self._collectors_by_module_id: Dict[int, StatisticsCollector] = {}
         self.preserve_batch_keep_mask = True
+
+    @staticmethod
+    def _collector_key(module: NamedModule) -> str:
+        return module.full_name
 
     def preprocess(self, module: NamedModule, **kwargs):
         del kwargs
@@ -83,19 +88,30 @@ class StatisticsProcessor(LoopProcessor):
             hessian=self.qcfg.hessian,
             row_buffer_max_rows=row_budget,
         )
-        self._collectors[module.name] = collector
+        collector_key = self._collector_key(module)
+        self._collectors[collector_key] = collector
+        self._collectors_by_module_id[id(module.module)] = collector
         module.state[PTQ_STATS_KEY] = collector
 
     def is_skipped(self, module: NamedModule) -> bool:
-        return module.name not in self._collectors
+        return self._collector_key(module) not in self._collectors
 
     def has_captured_input_ids(self, name: str) -> bool:
-        collector = self._collectors.get(name)
-        return collector is not None and collector.nsamples > 0
+        for key, collector in self._collectors.items():
+            if key == name or key.endswith(f".{name}"):
+                if collector.nsamples > 0:
+                    return True
+        return False
 
     def pre_process_fwd_hook(self, name: str) -> Callable[[Module, Tuple[torch.Tensor, ...], torch.Tensor], None]:
         def hook(_module, inp: Tuple[torch.Tensor, ...], _out: torch.Tensor):
-            collector = self._collectors.get(name)
+            collector = self._collectors_by_module_id.get(id(_module))
+            if collector is None:
+                module_key = getattr(_module, "module_name", None)
+                if module_key:
+                    collector = self._collectors.get(module_key)
+            if collector is None:
+                collector = self._collectors.get(name)
             if collector is None or not inp:
                 return
 
@@ -129,7 +145,9 @@ class StatisticsProcessor(LoopProcessor):
         subset_total: Optional[int] = None,
     ):
         del device, subset, previous_subset, subset_index, subset_total
-        collector = self._collectors.get(module.name)
+        collector = self._collectors_by_module_id.get(id(module.module))
+        if collector is None:
+            collector = self._collectors.get(self._collector_key(module))
         if collector is None:
             return
         rows, _ = get_number_of_rows_and_cols(module)
@@ -174,7 +192,8 @@ class StatisticsProcessor(LoopProcessor):
 
     def submodule_finalize(self, module: NamedModule, model: BaseQModel, **kwargs):
         del model, kwargs
-        collector = self._collectors.pop(module.name, None)
+        self._collectors_by_module_id.pop(id(module.module), None)
+        collector = self._collectors.pop(self._collector_key(module), None)
         if collector is not None:
             collector.free()
         module.state.pop(PTQ_STATS_KEY, None)

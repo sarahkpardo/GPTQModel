@@ -703,9 +703,15 @@ def run_layer_stage(
                     region_timer.flush()
 
             if execution_config.fwd_replay_after_process:
-                processor.clear_cache_data()
-                processor.receive_layer_inputs(layer_outputs)
-                layer_inputs = processor.inputs_cache.layer_inputs
+                if not is_last_module and not layer_outputs:
+                    raise ValueError(
+                        f"Layer `{layer_descriptor}` replay produced no outputs; "
+                        f"cannot advance calibration activations to the next layer."
+                    )
+                if layer_outputs:
+                    processor.clear_cache_data()
+                    processor.receive_layer_inputs(layer_outputs)
+                    layer_inputs = processor.inputs_cache.layer_inputs
                 pb.title(layer_title).subtitle("").draw()
 
             if p_index == len(looper.processors) - 1:
