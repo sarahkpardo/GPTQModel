@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional
 import torch
 import transformers
 
+from ..looper.loop_processor import ExecutionConfig, LoopProcessor
 from ..looper.processor_args import calibration_processor_kwargs
 from ..looper.named_module import NamedModule
 from ..quantization.config import AutoModuleDecoderConfig, SmootherConfig, TensorParallelPadderConfig

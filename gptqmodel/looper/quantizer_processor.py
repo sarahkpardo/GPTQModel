@@ -127,6 +127,9 @@ class QuantizerProcessor(LoopProcessor):
     ):
         self.capture_mode = capture_mode
         inline = capture_mode == "inline"
+        target = weight_quantize or resolve_weight_quantize_target(qcfg)
+        self.weight_quantize = target
+
         super().__init__(
             tokenizer=tokenizer,
             qcfg=qcfg,
@@ -143,8 +146,6 @@ class QuantizerProcessor(LoopProcessor):
             ),
         )
 
-        target = weight_quantize or resolve_weight_quantize_target(qcfg)
-        self.weight_quantize = target
         self.optimizer = None if inline else build_weight_optimizer(target, qcfg)
         self.calculate_w_wq_diff = calculate_w_wq_diff
         self.avg_losses = []
@@ -152,6 +153,9 @@ class QuantizerProcessor(LoopProcessor):
         self._split_modules: Dict[str, bool] = {}
 
     def set_calibration_dataset(self, calibration_dataset):
+        if self.capture_mode == "none":
+            # PTQ split: statistics/transform stages own calibration; only inherit input cache.
+            return
         raise NotImplementedError("QuantizerProcessor's calibration_dataset cannot be modified")
 
     def preprocess(self, module: NamedModule, fallback=None, **kwargs):
