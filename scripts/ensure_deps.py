@@ -43,6 +43,11 @@ def main() -> int:
         default=REQUIREMENTS_FILE,
         help="Requirements file to validate (default: requirements.txt).",
     )
+    parser.add_argument(
+        "--skip-pip-check",
+        action="store_true",
+        help="Skip pip check after upgrading runtime dependencies.",
+    )
     args = parser.parse_args()
 
     runtime_reqs = parse_requirements(args.requirements_file)
@@ -66,7 +71,10 @@ def main() -> int:
 
     if args.build:
         ensure_build_tools()
-    ensure_runtime_requirements(args.requirements_file)
+    ensure_runtime_requirements(
+        args.requirements_file,
+        run_pip_check=not args.skip_pip_check,
+    )
     return 0
 
 

@@ -91,7 +91,23 @@ def _upgrade_packages(specs: list[str]) -> None:
 
 
 def pip_check() -> None:
-    subprocess.check_call([sys.executable, "-m", "pip", "check"])
+    completed = subprocess.run(
+        [sys.executable, "-m", "pip", "check"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.stdout:
+        print(completed.stdout, end="")
+    if completed.stderr:
+        print(completed.stderr, end="", file=sys.stderr)
+    if completed.returncode != 0:
+        raise subprocess.CalledProcessError(
+            completed.returncode,
+            completed.args,
+            output=completed.stdout,
+            stderr=completed.stderr,
+        )
 
 
 def ensure_build_tools() -> list[str]:
