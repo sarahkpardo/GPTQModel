@@ -1,5 +1,7 @@
 recursive-include build_support *.py
 include scripts/ensure_deps.py
+include scripts/test_ptq_cholesky_parity.py
+include scripts/quantize_small_model_smoke.py
 recursive-include gptqmodel_ext/awq *.h *.cuh *.cu *.cpp
 recursive-include gptqmodel_ext/exllamav3 *.h *.hpp *.cuh *.cu *.cpp *.c
 recursive-include gptqmodel_ext/exllamav2 *.h *.cuh *.cu *.cpp

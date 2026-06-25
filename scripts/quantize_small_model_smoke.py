@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 ModelCloud.ai
+# SPDX-License-Identifier: Apache-2.0
+"""End-to-end smoke test: quantize a small HF model, save, reload, and generate.
+
+Uses Cholesky Hessian by default to avoid QR-GPTQ while validating the PTQ pipeline.
+
+Usage:
+    python scripts/quantize_small_model_smoke.py
+    python scripts/quantize_small_model_smoke.py --model-id gpt2 --pipeline ptq --device cpu
+    python scripts/quantize_small_model_smoke.py --model-id gpt2 --compare --device cpu
+"""
+
+from __future__ import annotations
+
+import argparse
+import shutil
+import sys
+import tempfile
+from pathlib import Path
+from typing import Literal
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+
+def _require_runtime_deps() -> None:
+    missing: list[str] = []
+    for package in ("logbar", "pcre"):
+        try:
+            __import__(package)
+        except ImportError:
+            missing.append("pypcre" if package == "pcre" else package)
+    if missing:
+        raise SystemExit(
+            "Missing runtime packages: "
+            + ", ".join(missing)
+            + ". Install GPTQModel first, e.g.\n"
+            "  pip install -e .\n"
+            "  python scripts/ensure_deps.py --skip-pip-check"
+        )
+
+
+_require_runtime_deps()
+
+from gptqmodel import BACKEND, GPTQModel, QuantizeConfig  # noqa: E402
+
+PipelineMode = Literal["legacy", "ptq"]
+
+_DEFAULT_CALIBRATION = [
+    "GPTQModel quantizes language models with calibration data.",
+    "Small models are useful for fast regression testing of quantization pipelines.",
+    "Cholesky Hessian factorization avoids the QR path during PTQ refactor testing.",
+    "Identity transforms should preserve legacy GPTQ behavior on full models.",
+] * 2
+
+
+def _build_quantize_config(
+    pipeline: PipelineMode,
+    *,
+    bits: int,
+    group_size: int,
+    device: str,
+) -> QuantizeConfig:
+    kwargs = dict(
+        bits=bits,
+        group_size=group_size,
+        sym=True,
+        desc_act=False,
+        damp_percent=0.01,
+        damp_auto_increment=0.01,
+        device=device,
+        hessian={"factorization": "cholesky", "row_buffer_max_rows": 512},
+    )
+    if pipeline == "ptq":
+        kwargs["weight_prepare"] = [{"method": "identity"}]
+    return QuantizeConfig(**kwargs)
+
+
+def _resolve_backend(device: str):
+    if device == "cpu":
+        return BACKEND.TORCH
+    return None
+
+
+def _run_pipeline_smoke(
+    *,
+    model_id: str,
+    pipeline: PipelineMode,
+    output_dir: Path,
+    calibration: list[str],
+    bits: int,
+    group_size: int,
+    batch_size: int,
+    device: str,
+    prompt: str,
+    max_new_tokens: int,
+) -> list[int]:
+    qcfg = _build_quantize_config(pipeline, bits=bits, group_size=group_size, device=device)
+    backend = _resolve_backend(device)
+
+    print(f"Loading {model_id!r} (pipeline={pipeline}, factorization=cholesky)...")
+    load_kwargs = {"quantize_config": qcfg}
+    if backend is not None:
+        load_kwargs["backend"] = backend
+    model = GPTQModel.load(model_id, **load_kwargs)
+
+    print("Quantizing...")
+    quantize_kwargs = {
+        "batch_size": batch_size,
+        "calibration_data_min_length": 1,
+    }
+    if backend is not None:
+        quantize_kwargs["backend"] = backend
+    model.quantize(calibration, **quantize_kwargs)
+
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Saving to {output_dir}...")
+    model.save(str(output_dir))
+    del model
+
+    reload_kwargs = {"device": device}
+    if backend is not None:
+        reload_kwargs["backend"] = backend
+    print("Reloading quantized checkpoint...")
+    reloaded = GPTQModel.load(str(output_dir), **reload_kwargs)
+
+    print(f"Generating from prompt: {prompt!r}")
+    token_ids = reloaded.generate(
+        prompt,
+        max_new_tokens=max_new_tokens,
+        do_sample=False,
+        num_beams=1,
+    )
+    decoded = reloaded.tokenizer.decode(token_ids[0], skip_special_tokens=True)
+    print(f"Generation: {decoded}")
+    del reloaded
+    return token_ids[0].tolist()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Smoke-test GPTQ quantization on a small model.")
+    parser.add_argument("--model-id", default="gpt2")
+    parser.add_argument(
+        "--pipeline",
+        choices=("legacy", "ptq"),
+        default="legacy",
+        help="legacy = GPTQProcessor only; ptq = Statistics + identity transform + GPTQ",
+    )
+    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument("--bits", type=int, default=4)
+    parser.add_argument("--group-size", type=int, default=128)
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--prompt", default="The capital of France is")
+    parser.add_argument("--max-new-tokens", type=int, default=16)
+    parser.add_argument(
+        "--compare",
+        action="store_true",
+        help="Run legacy and ptq pipelines and compare generated token ids.",
+    )
+    args = parser.parse_args()
+
+    if args.compare and args.pipeline != "legacy":
+        print("Note: --compare runs both legacy and ptq; ignoring --pipeline.", file=sys.stderr)
+
+    with tempfile.TemporaryDirectory(prefix="gptqmodel-smoke-") as tmp_root:
+        tmp_path = Path(tmp_root)
+        if args.compare:
+            legacy_tokens = _run_pipeline_smoke(
+                model_id=args.model_id,
+                pipeline="legacy",
+                output_dir=tmp_path / "legacy",
+                calibration=_DEFAULT_CALIBRATION,
+                bits=args.bits,
+                group_size=args.group_size,
+                batch_size=args.batch_size,
+                device=args.device,
+                prompt=args.prompt,
+                max_new_tokens=args.max_new_tokens,
+            )
+            ptq_tokens = _run_pipeline_smoke(
+                model_id=args.model_id,
+                pipeline="ptq",
+                output_dir=tmp_path / "ptq",
+                calibration=_DEFAULT_CALIBRATION,
+                bits=args.bits,
+                group_size=args.group_size,
+                batch_size=args.batch_size,
+                device=args.device,
+                prompt=args.prompt,
+                max_new_tokens=args.max_new_tokens,
+            )
+            if legacy_tokens == ptq_tokens:
+                print("PASS: legacy and PTQ pipelines produced identical token ids.")
+                return 0
+            print("FAIL: legacy and PTQ pipelines produced different token ids.")
+            print(f"  legacy: {legacy_tokens}")
+            print(f"  ptq:    {ptq_tokens}")
+            return 1
+
+        output_dir = args.output_dir or (tmp_path / args.pipeline)
+        _run_pipeline_smoke(
+            model_id=args.model_id,
+            pipeline=args.pipeline,
+            output_dir=output_dir,
+            calibration=_DEFAULT_CALIBRATION,
+            bits=args.bits,
+            group_size=args.group_size,
+            batch_size=args.batch_size,
+            device=args.device,
+            prompt=args.prompt,
+            max_new_tokens=args.max_new_tokens,
+        )
+        if args.output_dir is not None:
+            print(f"Checkpoint kept at {args.output_dir}")
+
+    print(f"PASS: {args.pipeline} pipeline smoke test completed.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -193,6 +193,11 @@ def _run_ptq_split_gptq(
 
 
 def _report_diff(label: str, left: torch.Tensor, right: torch.Tensor) -> None:
+    if left.dtype in (torch.int8, torch.int16, torch.int32, torch.int64, torch.uint8):
+        mismatches = int((left != right).sum().item())
+        print(f"{label}: mismatches={mismatches}, equal={torch.equal(left, right)}")
+        return
+
     diff = (left - right).abs()
     print(
         f"{label}: max={diff.max().item():.6e}, mean={diff.mean().item():.6e}, "
