@@ -76,7 +76,7 @@ def test_collect_outdated_flags_missing_pypcre(monkeypatch):
     requirements = [Requirement("pypcre>=0.3.2"), Requirement("packaging>=24.2")]
 
     def fake_version(name: str):
-        return {"packaging": "24.2"}[name]
+        return {"packaging": "24.2"}.get(name)
 
     monkeypatch.setattr("build_support.deps.get_installed_version", fake_version)
     outdated = collect_outdated(requirements)
@@ -88,7 +88,7 @@ def test_collect_outdated_skips_satisfied_packages(monkeypatch):
     requirements = [Requirement("pypcre>=0.3.2"), Requirement("packaging>=24.2")]
 
     def fake_version(name: str):
-        return {"pypcre": "0.3.2", "packaging": "24.2"}[name]
+        return {"pypcre": "0.3.2", "packaging": "24.2"}.get(name)
 
     monkeypatch.setattr("build_support.deps.get_installed_version", fake_version)
     assert collect_outdated(requirements) == []
