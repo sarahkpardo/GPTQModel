@@ -1196,9 +1196,25 @@ class HessianConfig:
         default=torch.float32,
         metadata={"help": "Stage Hessian chunks in a lower precision dtype when supported"},
     )
+    factorization: str = field(
+        default="qr",
+        metadata={
+            "help": "Hessian factorization for GPTQ error propagation: "
+            "'qr' (Householder QR of activations, numerically stable) or "
+            "'cholesky' (classic Cholesky of H and H^{-1})"
+        },
+    )
 
     def __post_init__(self):
         """Validate Hessian chunking and staging dtype settings."""
+
+        if isinstance(self.factorization, str):
+            self.factorization = self.factorization.strip().lower()
+        if self.factorization not in ("qr", "cholesky"):
+            raise ValueError(
+                "HessianConfig: `factorization` must be 'qr' or 'cholesky', "
+                f"got `{self.factorization}`."
+            )
 
         if self.chunk_size is not None:
             if not isinstance(self.chunk_size, int):
@@ -3135,6 +3151,7 @@ class GPTQConfig(PreProcessorConfig):
             "chunk_size": self.hessian.chunk_size,
             "chunk_bytes": self.hessian.chunk_bytes,
             "staging_dtype": str(self.hessian.staging_dtype).split(".")[-1],
+            "factorization": self.hessian.factorization,
         }
 
     def _update_output_payload(self, out: Dict[str, Any]) -> None:

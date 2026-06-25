@@ -194,8 +194,8 @@ def test_hessian_chunk_consistency_matches_full_precision():
 
     calib = torch.randn(128, 32, dtype=torch.float16)
 
-    _, full_xtx, full_device = gptq_full.process_batch(calib.clone())
-    _, chunked_xtx, chunked_device = gptq_chunked.process_batch(calib.clone())
+    _, full_xtx, full_device, _ = gptq_full.process_batch(calib.clone())
+    _, chunked_xtx, chunked_device, _ = gptq_chunked.process_batch(calib.clone())
 
     assert full_device == chunked_device
     assert full_xtx is not None and chunked_xtx is not None
@@ -216,12 +216,12 @@ def test_hessian_staging_dtype_accuracy_cuda():
 
     qcfg_default = QuantizeConfig(hessian=HessianConfig(staging_dtype=torch.float32))
     gptq_default = GPTQ(_clone_module(base).to(device), qcfg_default)
-    _, baseline_xtx, _ = gptq_default.process_batch(calib.clone())
+    _, baseline_xtx, _, _ = gptq_default.process_batch(calib.clone())
 
     for staging_dtype in (torch.bfloat16, torch.float16):
         qcfg = QuantizeConfig(hessian=HessianConfig(staging_dtype=staging_dtype))
         gptq = GPTQ(_clone_module(base).to(device), qcfg)
-        _, staged_xtx, _ = gptq.process_batch(calib.clone())
+        _, staged_xtx, _, _ = gptq.process_batch(calib.clone())
 
         assert baseline_xtx is not None and staged_xtx is not None
         assert torch.allclose(baseline_xtx, staged_xtx, atol=1e-2, rtol=1e-2)
@@ -240,15 +240,15 @@ def test_hessian_bf16_vs_fp32_staging_closeness():
 
     qcfg_default = QuantizeConfig()
     gptq_default = GPTQ(_clone_module(base).to(device), qcfg_default)
-    _, default_xtx, _ = gptq_default.process_batch(calib.clone())
+    _, default_xtx, _, _ = gptq_default.process_batch(calib.clone())
 
     qcfg_fp32 = QuantizeConfig(hessian=HessianConfig(staging_dtype=torch.float32))
     gptq_fp32 = GPTQ(_clone_module(base).to(device), qcfg_fp32)
-    _, fp32_xtx, _ = gptq_fp32.process_batch(calib.clone())
+    _, fp32_xtx, _, _ = gptq_fp32.process_batch(calib.clone())
 
     qcfg_bf16 = QuantizeConfig(hessian=HessianConfig(staging_dtype=torch.bfloat16))
     gptq_bf16 = GPTQ(_clone_module(base).to(device), qcfg_bf16)
-    _, bf16_xtx, _ = gptq_bf16.process_batch(calib.clone())
+    _, bf16_xtx, _, _ = gptq_bf16.process_batch(calib.clone())
 
     assert default_xtx is not None and fp32_xtx is not None and bf16_xtx is not None
     assert torch.allclose(default_xtx, fp32_xtx, atol=1e-4, rtol=1e-4)
@@ -369,7 +369,7 @@ def test_hessian_workspace_thread_safety_cuda():
         torch.cuda.set_device(device.index or 0)
         for i in range(iters_per_worker):
             calib = torch.randn(rows, base.in_features, device=device, dtype=torch.float16)
-            batch_size, xtx, canonical_device = gptq.process_batch(calib)
+            batch_size, xtx, canonical_device, _ = gptq.process_batch(calib)
             assert batch_size == rows
             assert xtx is not None
             assert canonical_device == device
@@ -636,6 +636,29 @@ def test_hessian_inverse_handles_singleton_flooring():
     reconstructed = hessian_inv.transpose(-1, -2) @ hessian_inv
     expected_inverse = torch.linalg.inv(damped)
     assert torch.allclose(reconstructed, expected_inverse, atol=1e-6, rtol=1e-4)
+
+
+def test_hessian_inverse_cholesky_factorization_flag():
+    gptq = _build_gptq(damp_percent=0.05, damp_auto_increment=0.05)
+    gptq.qcfg.hessian.factorization = "cholesky"
+    device = gptq.module.target_device
+    hessian = torch.tensor(
+        [[4.0, 1.0, 0.5], [1.0, 3.0, 0.2], [0.5, 0.2, 2.5]],
+        dtype=torch.float32,
+        device=device,
+    )
+    original = hessian.clone()
+    fake_qr = torch.eye(3, device=device)
+
+    hessian_inv, used_damp = gptq.hessian_inverse(hessian, qr_R=fake_qr)
+
+    assert hessian_inv is not None
+    assert torch.allclose(hessian, original)
+    damped = _damped_hessian(hessian, used_damp)
+    reconstructed = hessian_inv.transpose(-1, -2) @ hessian_inv
+    expected_inverse = torch.linalg.inv(damped)
+    assert torch.allclose(reconstructed, expected_inverse, atol=1e-6, rtol=1e-5)
+
 
 ######### test_hessian_merge.py #########
 

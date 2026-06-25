@@ -34,6 +34,13 @@ from .gar import (
     invert_perm,
 )
 from .npu_linalg import npu_inverse_cholesky_factor
+from .qr_gptq_linalg import (
+    apply_column_perm_to_qr,
+    cholesky_hessian_inverse,
+    merge_qr_factors,
+    qr_hessian_inverse,
+    update_qr_factor,
+)
 from .quantizer import HF_OPTIMUM, Quantizer
 
 
@@ -228,6 +235,8 @@ class GPTQ:
         # keep local accumulators and merge only once when quantization begins.
         self._device_hessian_partials: Dict[torch.device, torch.Tensor] = {}
         self._device_sample_counts: Dict[torch.device, int] = {}
+        self._device_qr_partials: Dict[torch.device, torch.Tensor] = {}
+        self._qr_R: Optional[torch.Tensor] = None
         self._hessian_dirty: bool = False
 
         self._borrow_workspace_stats = {
@@ -329,8 +338,35 @@ class GPTQ:
 
         return tensor.narrow(tensor.dim() - 1, 0, trim).contiguous()
 
+    def _uses_qr_factorization(self) -> bool:
+        return getattr(self.qcfg.hessian, "factorization", "qr") == "qr"
+
+    def _update_qr_from_matrix(self, matrix: torch.Tensor, device: torch.device) -> None:
+        rows = matrix.shape[0]
+        if rows == 0:
+            return
+
+        stage_dtype = self.preferred_staging_dtype(matrix.dtype, matrix.device)
+        chunk_size = self.resolve_hessian_chunk_size(rows, stage_dtype)
+        R = self._device_qr_partials.get(device)
+
+        if chunk_size is None:
+            R = update_qr_factor(R, matrix.to(dtype=torch.float32))
+        else:
+            for start in range(0, rows, chunk_size):
+                rows_this = min(chunk_size, rows - start)
+                source = matrix[start:start + rows_this]
+                with self.borrow_materialized_chunk_fp32(source, rows_this) as materialized:
+                    R = update_qr_factor(R, materialized)
+
+        self._device_qr_partials[device] = R
+
     def add_batch(self, inp: torch.Tensor, out: torch.Tensor, batch_index: Optional[int] = None):
-        batch_token_size, xtx, device = self.process_batch(inp)
+        retain_activations = self._uses_qr_factorization()
+        batch_token_size, xtx, device, activation_matrix = self.process_batch(
+            inp,
+            retain_activations=retain_activations,
+        )
         if batch_token_size == 0 or xtx is None:
             return
 
@@ -345,6 +381,10 @@ class GPTQ:
             else:
                 existing.add_(xtx)
                 del xtx
+
+            if retain_activations and activation_matrix is not None:
+                self._update_qr_from_matrix(activation_matrix, dev)
+                del activation_matrix
 
             self._device_sample_counts[dev] = self._device_sample_counts.get(dev, 0) + batch_token_size
             self.nsamples += batch_token_size
@@ -483,7 +523,11 @@ class GPTQ:
         torch_sync(device=xtx_accum.device)
         return xtx_accum
 
-    def process_batch(self, inp: torch.Tensor) -> Tuple[int, Optional[torch.Tensor], torch.device]:
+    def process_batch(
+        self,
+        inp: torch.Tensor,
+        retain_activations: bool = False,
+    ) -> Tuple[int, Optional[torch.Tensor], torch.device, Optional[torch.Tensor]]:
         # print(f"inp = {inp}")
         # print(f"self.module = {self.module} device = {self.module.target_device}")
         inp_device = get_device(inp)
@@ -538,10 +582,13 @@ class GPTQ:
 
         if batch_token_size == 0:
             del reshaped_inp
-            return 0, None, canonical_device
+            return 0, None, canonical_device, None
 
+        activation_matrix = None
         try:
             xtx = self.compute_hessian_xtx(reshaped_inp).to(dtype=torch.float32)
+            if retain_activations:
+                activation_matrix = reshaped_inp.to(dtype=torch.float32).detach()
         except RuntimeError as exc:
             if (
                 torch.device(inp_device).type == "cuda"
@@ -558,6 +605,8 @@ class GPTQ:
                 canonical_device = torch.device("cpu")
                 xtx = self.compute_hessian_xtx(reshaped_inp_cpu).to(dtype=torch.float32)
                 xtx = xtx.detach()
+                if retain_activations:
+                    activation_matrix = reshaped_inp_cpu.to(dtype=torch.float32).detach()
                 del reshaped_inp_cpu
             else:
                 del reshaped_inp
@@ -567,7 +616,7 @@ class GPTQ:
             del reshaped_inp
 
         self._snapshot_borrow_workspace_stats(context="process_batch")
-        return batch_token_size, xtx, canonical_device
+        return batch_token_size, xtx, canonical_device, activation_matrix
 
     def _select_hessian_target_device(self, requested: Optional[torch.device]) -> torch.device:
         if requested is not None:
@@ -620,6 +669,8 @@ class GPTQ:
                 self._final_hessian_device_hint = device
                 self._device_hessian_partials.clear()
                 self._device_sample_counts.clear()
+                self._device_qr_partials.clear()
+                self._qr_R = None
                 return
 
             for partial_device, partial in self._device_hessian_partials.items():
@@ -648,6 +699,20 @@ class GPTQ:
             self._final_hessian_device_hint = result_accum.device
             self._device_hessian_partials.clear()
             self._device_sample_counts.clear()
+
+            if self._uses_qr_factorization() and self._device_qr_partials:
+                merged_R: Optional[torch.Tensor] = None
+                for partial_R in self._device_qr_partials.values():
+                    partial_R = partial_R.to(device=result_accum.device, dtype=torch.float32)
+                    if merged_R is None:
+                        merged_R = partial_R
+                    else:
+                        merged_R = merge_qr_factors(merged_R, partial_R)
+                self._qr_R = merged_R
+            else:
+                self._qr_R = None
+            self._device_qr_partials.clear()
+
             del result_accum
 
     def finalize_hessian(self, target_device: Optional[torch.device] = None) -> torch.Tensor:
@@ -832,10 +897,17 @@ class GPTQ:
         return scale, zero, g_idx, duration, avg_loss, damp_percent
 
     @torch.inference_mode()
-    def hessian_inverse(self, H: torch.Tensor):
+    def hessian_inverse(self, H: torch.Tensor, qr_R: Optional[torch.Tensor] = None):
         # Capture a writable view of the Hessian diagonal so we can restore it between attempts.
         diag_view = H.diagonal()
         orig_diag = diag_view.clone()
+
+        use_qr = (
+            qr_R is not None
+            and self.nsamples > 0
+            and self._uses_qr_factorization()
+            and H.device.type != "npu"
+        )
 
         # When a block is numerically singular, pure damping can stall at 1.0.
         # Prepare a tiny diagonal floor (relative to the largest entry) that we
@@ -874,14 +946,20 @@ class GPTQ:
 
             while 0 < damp < 1:
                 try:
-                    diag_view.add_(damp * mean)
-                    if H.device.type == "npu":
-                        Hinv_result = npu_inverse_cholesky_factor(H)
+                    if use_qr:
+                        Hinv_result = qr_hessian_inverse(
+                            qr_R,
+                            nsamples=self.nsamples,
+                            damp=damp,
+                            damp_mean=float(mean.item()),
+                        )
                     else:
-                        H2 = torch.linalg.cholesky(H)
-                        Hinv_result = torch.linalg.cholesky(torch.cholesky_inverse(H2), upper=True)
-                        del H2
-                    diag_view.copy_(current_diag)
+                        diag_view.add_(damp * mean)
+                        if H.device.type == "npu":
+                            Hinv_result = npu_inverse_cholesky_factor(H)
+                        else:
+                            Hinv_result = cholesky_hessian_inverse(H)
+                        diag_view.copy_(current_diag)
                     used_damp = damp
                     if damp_recovery_started:
                         log.warn(
@@ -891,7 +969,8 @@ class GPTQ:
                     return Hinv_result, used_damp
                 except torch._C._LinAlgError as e:
                     last_error = e
-                    diag_view.copy_(current_diag)
+                    if not use_qr:
+                        diag_view.copy_(current_diag)
                     if self.qcfg.damp_auto_increment != 0:
                         if not damp_recovery_started:
                             damp_recovery_started = True
@@ -903,8 +982,9 @@ class GPTQ:
                         damp += self.qcfg.damp_auto_increment
                         recovery_last_damp = damp
                     else:
+                        factorization = "QR" if use_qr else "Cholesky"
                         log.warn(
-                            f"Quantization: Module `{self.name}` -> Hessian Cholesky failed with `damp_percent={damp:.5f}` and no auto increment configured.")
+                            f"Quantization: Module `{self.name}` -> Hessian {factorization} failed with `damp_percent={damp:.5f}` and no auto increment configured.")
                         break
 
             if damp_recovery_started:
@@ -1056,8 +1136,20 @@ class GPTQ:
                 self.quantizer.find_params(W, weight=True)
 
         if use_hessian:
+            qr_R = self._qr_R
+            column_perm = None
+            if self.qcfg.desc_act:
+                column_perm = perm
+            elif self.qcfg.act_group_aware:
+                column_perm = final_perm
+
+            if qr_R is not None and column_perm is not None:
+                qr_R = apply_column_perm_to_qr(qr_R, column_perm)
+            if qr_R is not None:
+                qr_R = qr_R.to(device=self.H.device)
+
             try:
-                Hinv, damp = self.hessian_inverse(self.H)
+                Hinv, damp = self.hessian_inverse(self.H, qr_R=qr_R)
             except RuntimeError as exc:
                 if self.H.device.type != "cuda" or "out of memory" not in str(exc).lower():
                     raise
@@ -1070,7 +1162,9 @@ class GPTQ:
                 self.H = self.H.to(device=cpu_device)
                 W = W.to(device=cpu_device)
                 self.quantizer.find_params(W, weight=True)
-                Hinv, damp = self.hessian_inverse(self.H)
+                if qr_R is not None:
+                    qr_R = qr_R.to(device=cpu_device)
+                Hinv, damp = self.hessian_inverse(self.H, qr_R=qr_R)
         else:
             Hinv, damp = None, 0.0
 
@@ -1238,6 +1332,7 @@ class GPTQ:
 
         if Hinv is not None:
             del Hinv
+            self._qr_R = None
             if self.nsamples != 0:
                 avg_loss = torch.sum(Losses).item() / self.nsamples
 
