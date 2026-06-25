@@ -152,7 +152,7 @@ jobs:
           /opt/env/install_torch.sh ${{ inputs.check_vm_cuda_version }} ${{ env.TORCH_VERSION }}
           uv pip install -r requirements.txt  -i http://$RUNNER/simple/ --trusted-host $RUNNER --extra-index-url https://pypi.org/simple
           rm -rf dist
-          python -m build --sdist
+          GPTQMODEL_SKIP_DEP_UPGRADE=1 python -m build --sdist
           uv pip install dist/*.tar.gz -i http://$RUNNER/simple/ --trusted-host $RUNNER --extra-index-url https://pypi.org/simple
           .github/scripts/ci_install_modelcloud_git_deps.sh
           /opt/env/install_torch.sh ${{ inputs.check_vm_cuda_version }} ${{ env.TORCH_VERSION }}

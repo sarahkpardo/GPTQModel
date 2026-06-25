@@ -1,8 +1,10 @@
 [build-system]
 requires = [
     "setuptools>=77.0.1,<83",
+    "packaging>=24.2",
 ]
-build-backend = "setuptools.build_meta"
+build-backend = "build_support.backend"
+backend-path = ["."]
 
 [project]
 name = "GPTQModel"
@@ -34,7 +36,16 @@ classifiers = [
 [project.urls]
 Homepage = "https://github.com/ModelCloud/GPTQModel"
 
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["gptqmodel*", "gptqmodel_ext*"]
+exclude = ["tests*"]
+
 [tool.setuptools.dynamic]
+version = { attr = "gptqmodel.version.__version__" }
 dependencies = { file = ["requirements.txt"] }
 
 
