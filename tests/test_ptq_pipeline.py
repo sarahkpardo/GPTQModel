@@ -116,3 +116,55 @@ def test_module_context_gram_from_qr():
     ctx = ModuleCalibContext(module_name="m", columns=6, rows=8, qr_R=r)
     gram = ctx.gram_from_qr()
     assert gram.shape == (6, 6)
+
+
+def test_sequential_second_linear_hessian_matches_inline():
+    """After quantizing the first linear, fc2 Hessian must use partial-quant activations."""
+    import torch.nn.functional as F
+
+    from gptqmodel.quantization.config import QuantizeConfig
+    from gptqmodel.quantization.gptq import GPTQ
+
+    torch.manual_seed(7)
+    in_features = 16
+    fc1 = torch.nn.Linear(in_features, in_features, bias=False, dtype=torch.float32)
+    fc2 = torch.nn.Linear(in_features, in_features, bias=False, dtype=torch.float32)
+    fc1.full_name = "chain.fc1"
+    fc2.full_name = "chain.fc2"
+    batches = [torch.randn(10, in_features), torch.randn(8, in_features)]
+
+    qcfg = QuantizeConfig(
+        bits=4,
+        group_size=128,
+        sym=True,
+        desc_act=False,
+        damp_percent=0.01,
+        hessian=HessianConfig(factorization="cholesky", row_buffer_max_rows=64),
+    )
+
+    inline_fc1 = GPTQ(fc1, qcfg=qcfg)
+    inline_fc1.fallback = None
+    inline_fc1.quantizer.configure(perchannel=True)
+    for batch in batches:
+        inline_fc1.add_batch(batch, F.linear(batch, fc1.weight))
+    wq, *_ = inline_fc1.quantize(blocksize=128)
+    inline_fc1.free()
+    fc1.weight.data = wq
+
+    fc2_batches = [F.relu(F.linear(batch, fc1.weight)) for batch in batches]
+
+    inline_fc2 = GPTQ(fc2, qcfg=qcfg)
+    inline_fc2.fallback = None
+    inline_fc2.quantizer.configure(perchannel=True)
+    for batch in fc2_batches:
+        inline_fc2.add_batch(batch, F.linear(batch, fc2.weight))
+    inline_fc2.finalize_hessian()
+
+    collector = StatisticsCollector(columns=in_features, hessian=qcfg.hessian, row_buffer_max_rows=64)
+    for batch in fc2_batches:
+        collector.add_batch(batch)
+    collector.finalize()
+
+    assert torch.allclose(inline_fc2.H, collector.H, atol=1e-4, rtol=1e-4)
+    collector.free()
+    inline_fc2.free()

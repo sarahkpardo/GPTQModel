@@ -37,24 +37,15 @@ def quantizer_processor_kwargs(args: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def build_gpt_quantizer_processors(qcfg, args, preprocessors):
-    """Build statistics/transform/quantizer processors for GPTQ method."""
-    from ..looper.gptq_processor import GPTQProcessor
-    from ..looper.statistics_processor import StatisticsProcessor
-    from ..looper.transform_processor import TransformProcessor
+    """Build the paper-aligned sequential PTQ processor for GPTQ method."""
+    from ..looper.sequential_ptq_processor import SequentialPTQProcessor
     from ..ptq.config import resolve_weight_quantize_target
 
-    calib_args = calibration_processor_kwargs(args)
     quant_args = quantizer_processor_kwargs(args)
     target = resolve_weight_quantize_target(qcfg)
 
-    if getattr(qcfg, "uses_ptq_transform_pipeline", None) and qcfg.uses_ptq_transform_pipeline():
-        return preprocessors + [
-            StatisticsProcessor(**calib_args),
-            TransformProcessor(**calib_args),
-            GPTQProcessor(**quant_args, weight_quantize=target, capture_mode="none"),
-        ]
     return preprocessors + [
-        GPTQProcessor(**quant_args, weight_quantize=target, capture_mode="inline"),
+        SequentialPTQProcessor(**quant_args, weight_quantize=target),
     ]
 
 

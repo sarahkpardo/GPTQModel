@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 ModelCloud.ai
 # SPDX-License-Identifier: Apache-2.0
-"""GPTQ weight optimizer backend wrapping the existing GPTQ class."""
+"""GPTQ weight optimizer backend wrapping the GptqSolver."""
 
 from __future__ import annotations
 
@@ -9,9 +9,9 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
-from ...quantization.gptq import GPTQ
 from ..config import WeightQuantizeTargetConfig
 from ..context import ModuleCalibContext, TransformState, WeightQuantState
+from ..solvers.gptq import GptqSolver
 
 
 def _module_label(module: nn.Module) -> str:
@@ -26,6 +26,7 @@ class GptqWeightOptimizer:
     def __init__(self, *, qcfg, target: Optional[WeightQuantizeTargetConfig] = None) -> None:
         self.qcfg = qcfg
         self.target = target
+        self._solver = GptqSolver()
 
     def optimize(
         self,
@@ -47,33 +48,25 @@ class GptqWeightOptimizer:
                 f"observed nsamples={ctx.nsamples}, H={'set' if ctx.H is not None else 'missing'}."
             )
 
-        gptq = GPTQ(module, qcfg=active_qcfg)
-        gptq.fallback = None
-        gptq.expected_nsamples = expected_nsamples
-        gptq.quantizer.configure(perchannel=True)
-        gptq.module.weight.data = gptq.module.weight.data.to(device)
-
-        gptq.H = ctx.H.to(device=device, dtype=torch.float32)
-        gptq.nsamples = ctx.nsamples
-        gptq._hessian_dirty = False
-        if ctx.qr_R is not None:
-            gptq._qr_R = ctx.qr_R.to(device=device, dtype=torch.float32)
-
-        blocksize = 128
-        wq, q_scales, q_zeros, q_g_idx, duration, avg_loss, damp, nsamples = gptq.quantize(
-            blocksize=blocksize
+        result = self._solver.solve(
+            module=module,
+            qcfg=active_qcfg,
+            H=ctx.H,
+            nsamples=ctx.nsamples,
+            qr_R=ctx.qr_R,
+            expected_nsamples=expected_nsamples,
         )
 
         return WeightQuantState(
-            q_scales=q_scales,
-            q_zeros=q_zeros,
-            q_g_idx=q_g_idx,
-            pack_weight=wq,
+            q_scales=result.q_scales,
+            q_zeros=result.q_zeros,
+            q_g_idx=result.q_g_idx,
+            pack_weight=result.pack_weight,
             extra={
-                "loss": avg_loss,
-                "gptq": gptq,
-                "duration": duration,
-                "damp": damp,
-                "nsamples": nsamples,
+                "loss": result.avg_loss,
+                "gptq": result.backend,
+                "duration": result.duration,
+                "damp": result.damp,
+                "nsamples": result.nsamples,
             },
         )

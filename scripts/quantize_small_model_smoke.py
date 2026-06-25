@@ -3,12 +3,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """End-to-end smoke test: quantize a small HF model, save, reload, and generate.
 
-Uses Cholesky Hessian by default to avoid QR-GPTQ while validating the PTQ pipeline.
+Uses Cholesky Hessian by default. The PTQ pipeline runs SequentialPTQProcessor
+(capture → transform → quantize per module, Chen et al. ordering).
 
 Usage:
     python scripts/quantize_small_model_smoke.py
     python scripts/quantize_small_model_smoke.py --model-id gpt2 --pipeline ptq --device cpu
     python scripts/quantize_small_model_smoke.py --model-id gpt2 --compare --device cpu
+    python scripts/quantize_small_model_smoke.py --model-fixture tiny-qwen3-moe --device cpu
 """
 
 from __future__ import annotations
@@ -47,6 +49,7 @@ _require_runtime_deps()
 from gptqmodel import BACKEND, GPTQModel, QuantizeConfig  # noqa: E402
 
 PipelineMode = Literal["legacy", "ptq"]
+ModelFixture = Literal["hf", "tiny-qwen3-moe"]
 
 _DEFAULT_CALIBRATION = [
     "GPTQModel quantizes language models with calibration data.",
@@ -62,6 +65,7 @@ def _build_quantize_config(
     bits: int,
     group_size: int,
     device: str,
+    moe: bool = False,
 ) -> QuantizeConfig:
     kwargs = dict(
         bits=bits,
@@ -75,7 +79,67 @@ def _build_quantize_config(
     )
     if pipeline == "ptq":
         kwargs["weight_prepare"] = [{"method": "identity"}]
+    if moe:
+        from gptqmodel.quantization.config import ExpertsRoutingOverride, MoEConfig
+
+        kwargs["moe"] = MoEConfig(routing=ExpertsRoutingOverride())
     return QuantizeConfig(**kwargs)
+
+
+def _build_tiny_qwen3_moe_fixture(model_dir: Path) -> str:
+    """Build and save a tiny Qwen3 MoE checkpoint; return the model directory path."""
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import Whitespace
+    from tokenizers.trainers import WordLevelTrainer
+    from transformers import PreTrainedTokenizerFast
+    from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeConfig, Qwen3MoeForCausalLM
+
+    calibration_texts = list(_DEFAULT_CALIBRATION)
+    config = Qwen3MoeConfig(
+        num_hidden_layers=1,
+        hidden_size=64,
+        intermediate_size=128,
+        moe_intermediate_size=32,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        num_experts=4,
+        num_experts_per_tok=2,
+        vocab_size=128,
+        pad_token_id=0,
+        bos_token_id=1,
+        eos_token_id=2,
+    )
+    model = Qwen3MoeForCausalLM(config)
+    model_dir.mkdir(parents=True, exist_ok=True)
+    model.save_pretrained(model_dir)
+
+    tokenizer = Tokenizer(WordLevel(unk_token="[UNK]"))
+    tokenizer.pre_tokenizer = Whitespace()
+    trainer = WordLevelTrainer(
+        special_tokens=["[PAD]", "[UNK]", "[BOS]", "[EOS]"],
+    )
+    tokenizer.train_from_iterator(calibration_texts, trainer=trainer)
+    fast_tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=tokenizer,
+        bos_token="[BOS]",
+        eos_token="[EOS]",
+        unk_token="[UNK]",
+        pad_token="[PAD]",
+    )
+    fast_tokenizer.save_pretrained(model_dir)
+    return str(model_dir)
+
+
+def _resolve_model_source(
+    *,
+    model_id: str,
+    model_fixture: ModelFixture,
+    work_dir: Path,
+) -> str:
+    if model_fixture == "tiny-qwen3-moe":
+        return _build_tiny_qwen3_moe_fixture(work_dir / "tiny-qwen3-moe")
+    return model_id
 
 
 def _resolve_backend(device: str):
@@ -87,6 +151,8 @@ def _resolve_backend(device: str):
 def _run_pipeline_smoke(
     *,
     model_id: str,
+    model_fixture: ModelFixture,
+    work_dir: Path,
     pipeline: PipelineMode,
     output_dir: Path,
     calibration: list[str],
@@ -97,14 +163,26 @@ def _run_pipeline_smoke(
     prompt: str,
     max_new_tokens: int,
 ) -> list[int]:
-    qcfg = _build_quantize_config(pipeline, bits=bits, group_size=group_size, device=device)
+    moe = model_fixture == "tiny-qwen3-moe"
+    qcfg = _build_quantize_config(
+        pipeline,
+        bits=bits,
+        group_size=group_size,
+        device=device,
+        moe=moe,
+    )
     backend = _resolve_backend(device)
+    model_source = _resolve_model_source(
+        model_id=model_id,
+        model_fixture=model_fixture,
+        work_dir=work_dir,
+    )
 
-    print(f"Loading {model_id!r} (pipeline={pipeline}, factorization=cholesky)...")
+    print(f"Loading {model_source!r} (pipeline={pipeline}, fixture={model_fixture}, factorization=cholesky)...")
     load_kwargs = {"quantize_config": qcfg}
     if backend is not None:
         load_kwargs["backend"] = backend
-    model = GPTQModel.load(model_id, **load_kwargs)
+    model = GPTQModel.load(model_source, **load_kwargs)
 
     print("Quantizing...")
     quantize_kwargs = {
@@ -145,10 +223,16 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Smoke-test GPTQ quantization on a small model.")
     parser.add_argument("--model-id", default="gpt2")
     parser.add_argument(
+        "--model-fixture",
+        choices=("hf", "tiny-qwen3-moe"),
+        default="hf",
+        help="hf = --model-id from HuggingFace; tiny-qwen3-moe = synthetic 1-layer MoE",
+    )
+    parser.add_argument(
         "--pipeline",
         choices=("legacy", "ptq"),
         default="legacy",
-        help="legacy = GPTQProcessor only; ptq = Statistics + identity transform + GPTQ",
+        help="legacy = implicit identity prepare; ptq = explicit weight_prepare identity",
     )
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--output-dir", type=Path, default=None)
@@ -163,6 +247,8 @@ def main() -> int:
         help="Run legacy and ptq pipelines and compare generated token ids.",
     )
     args = parser.parse_args()
+    if args.model_fixture == "tiny-qwen3-moe" and args.group_size == 128:
+        args.group_size = 32
 
     if args.compare and args.pipeline != "legacy":
         print("Note: --compare runs both legacy and ptq; ignoring --pipeline.", file=sys.stderr)
@@ -172,6 +258,8 @@ def main() -> int:
         if args.compare:
             legacy_tokens = _run_pipeline_smoke(
                 model_id=args.model_id,
+                model_fixture=args.model_fixture,
+                work_dir=tmp_path,
                 pipeline="legacy",
                 output_dir=tmp_path / "legacy",
                 calibration=_DEFAULT_CALIBRATION,
@@ -184,6 +272,8 @@ def main() -> int:
             )
             ptq_tokens = _run_pipeline_smoke(
                 model_id=args.model_id,
+                model_fixture=args.model_fixture,
+                work_dir=tmp_path,
                 pipeline="ptq",
                 output_dir=tmp_path / "ptq",
                 calibration=_DEFAULT_CALIBRATION,
@@ -205,6 +295,8 @@ def main() -> int:
         output_dir = args.output_dir or (tmp_path / args.pipeline)
         _run_pipeline_smoke(
             model_id=args.model_id,
+            model_fixture=args.model_fixture,
+            work_dir=tmp_path,
             pipeline=args.pipeline,
             output_dir=output_dir,
             calibration=_DEFAULT_CALIBRATION,

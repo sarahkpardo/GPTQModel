@@ -14,7 +14,7 @@ __all__ = ["GPTQProcessor", "QuantizerProcessor", "clone_gptq_config_for_module"
 
 
 class GPTQProcessor(QuantizerProcessor):
-    """GPTQ-specific quantizer processor; defaults to inline or split capture by config."""
+    """Deprecated inline GPTQ processor; use SequentialPTQProcessor via build_gpt_quantizer_processors."""
 
     def __init__(
         self,
@@ -34,11 +34,17 @@ class GPTQProcessor(QuantizerProcessor):
         if weight_quantize is None:
             weight_quantize = WeightQuantizeTargetConfig(method="gptq")
         if capture_mode is None:
-            uses_ptq = getattr(qcfg, "uses_ptq_transform_pipeline", None)
-            if callable(uses_ptq) and uses_ptq():
-                capture_mode = "none"
-            else:
-                capture_mode = "inline"
+            capture_mode = "inline"
+
+        if capture_mode == "inline":
+            import warnings
+
+            warnings.warn(
+                "GPTQProcessor inline capture is deprecated; the default GPTQ pipeline "
+                "uses SequentialPTQProcessor (capture → transform → quantize per module).",
+                DeprecationWarning,
+                stacklevel=2,
+            )
 
         super().__init__(
             tokenizer=tokenizer,

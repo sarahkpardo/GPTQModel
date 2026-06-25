@@ -464,6 +464,13 @@ Placement rule:
 - local target-only modification -> `prepare`
 - cross-target or rule-context modification -> `actions`
 
+**Runtime ordering (GPTQ / Chen et al.):** When `true_sequential` is enabled (default), the
+implementation captures activation statistics for each weight matrix **after** earlier matrices
+in the same layer have been quantized. The pipeline is therefore
+`forward_capture → prepare → quantize → writeback` per module, not a batch statistics pass over
+pristine weights followed by a separate quantize pass. This matches the sequential Hessian
+construction in Chen et al. (2025) Algorithm 1 / QR variant Algorithm 4.
+
 
 ### `quantize`
 

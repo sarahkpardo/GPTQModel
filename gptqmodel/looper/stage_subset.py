@@ -29,6 +29,8 @@ from .paroquant_processor import ParoQuantProcessor
 from .qqq_processor import QQQProcessor
 from .. import DEBUG_ON, DEVICE_THREAD_POOL
 from ..looper.gptq_processor import GPTQProcessor
+from ..looper.quantizer_processor import QuantizerProcessor
+from ..looper.sequential_ptq_processor import SequentialPTQProcessor
 from ..looper.loop_processor import LoopProcessor
 from ..looper.named_module import NamedModule
 from ..models._const import META
@@ -203,7 +205,10 @@ def _resolve_subset_calibration_coverage_policy(
 ) -> CalibrationCoveragePolicy:
     """Resolve how this subset handles modules that never receive calibration traffic."""
 
-    validate_input_coverage = isinstance(processor, (GPTQProcessor, QQQProcessor, AWQProcessor, ParoQuantProcessor))
+    validate_input_coverage = isinstance(
+        processor,
+        (GPTQProcessor, QuantizerProcessor, SequentialPTQProcessor, QQQProcessor, AWQProcessor, ParoQuantProcessor),
+    )
     fallback_enabled = fallback is not None
     prune_uncovered_modules = validate_input_coverage and not fallback_enabled
 

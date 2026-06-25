@@ -25,6 +25,8 @@ class StatisticsCollector:
     """
     Accumulate sufficient statistics without storing the full activation matrix.
 
+    Also exposed as ``HessianAccumulator`` for the PTQ protocol naming.
+
     Tiered memory policy:
     - GPU: one microbatch / chunk during forward hook
     - CPU: merged H or QR factor (O(c^2))
@@ -316,3 +318,7 @@ class StatisticsCollector:
         self._device_sample_counts.clear()
         self._device_qr_partials.clear()
         self._hessian_dirty = False
+
+
+# Protocol-facing alias for the Chen et al. / GPTQ Hessian accumulation stage.
+HessianAccumulator = StatisticsCollector
