@@ -1204,6 +1204,10 @@ class HessianConfig:
             "'cholesky' (classic Cholesky of H and H^{-1})"
         },
     )
+    row_buffer_max_rows: Optional[int] = field(
+        default=2048,
+        metadata={"help": "Maximum activation rows retained on CPU for transform optimization"},
+    )
 
     def __post_init__(self):
         """Validate Hessian chunking and staging dtype settings."""
@@ -1227,6 +1231,12 @@ class HessianConfig:
                 raise ValueError("HessianConfig: `chunk_bytes` must be an integer or None.")
             if self.chunk_bytes <= 0:
                 raise ValueError("HessianConfig: `chunk_bytes` must be a positive integer amount of bytes.")
+
+        if self.row_buffer_max_rows is not None:
+            if not isinstance(self.row_buffer_max_rows, int):
+                raise ValueError("HessianConfig: `row_buffer_max_rows` must be an integer or None.")
+            if self.row_buffer_max_rows < 0:
+                raise ValueError("HessianConfig: `row_buffer_max_rows` must be non-negative.")
 
         if isinstance(self.staging_dtype, str):
             self.staging_dtype = self.staging_dtype.lower()
@@ -3068,6 +3078,14 @@ class GPTQConfig(PreProcessorConfig):
         metadata={"help": "Skip heavy computations for fast model loading validation"},
     )
     hessian: Optional[HessianConfig] = field(default_factory=HessianConfig)
+    weight_prepare: Optional[List[Union[Dict[str, Any], Any]]] = field(
+        default=None,
+        metadata={"help": "Ordered transform.prepare steps applied before weight quantization"},
+    )
+    weight_export: Optional[Dict[str, Any]] = field(
+        default=None,
+        metadata={"help": "Export/runtime target for quantized modules (format, impl)"},
+    )
 
     def allowed_quant_methods(self) -> Tuple[METHOD, ...]:
         return (METHOD.GPTQ,)
@@ -3095,6 +3113,7 @@ class GPTQConfig(PreProcessorConfig):
         self.hessian = _normalize_hessian(self.hessian)
         self.gptaq = _normalize_gptaq(self.gptaq)
         self.foem = _normalize_foem(self.foem)
+        self._normalize_ptq_pipeline_fields()
 
         if act_group_aware_user_value is None:
             self.act_group_aware = self.method == METHOD.GPTQ
@@ -3127,6 +3146,27 @@ class GPTQConfig(PreProcessorConfig):
             )
             self.act_group_aware = False
 
+    def _normalize_ptq_pipeline_fields(self) -> None:
+        from ..ptq.config import ExportTargetConfig, normalize_transform_prepare
+
+        if self.weight_prepare is not None:
+            self.weight_prepare = normalize_transform_prepare(self.weight_prepare)
+        if self.weight_export is not None:
+            if not isinstance(self.weight_export, dict):
+                raise ValueError("GPTQConfig: `weight_export` must be a dict.")
+            ExportTargetConfig(
+                format=str(self.weight_export.get("format", "gptq")),
+                impl=str(self.weight_export.get("impl", "default")),
+                options={
+                    k: v
+                    for k, v in self.weight_export.items()
+                    if k not in {"format", "impl"}
+                },
+            )
+
+    def uses_ptq_transform_pipeline(self) -> bool:
+        return bool(self.weight_prepare)
+
     def _update_meta_payload(self, meta_payload: Dict[str, Any]) -> None:
         if self.gptaq is None:
             meta_payload["gptaq"] = None
@@ -3152,7 +3192,20 @@ class GPTQConfig(PreProcessorConfig):
             "chunk_bytes": self.hessian.chunk_bytes,
             "staging_dtype": str(self.hessian.staging_dtype).split(".")[-1],
             "factorization": self.hessian.factorization,
+            "row_buffer_max_rows": self.hessian.row_buffer_max_rows,
         }
+        if self.weight_prepare:
+            meta_payload["weight_prepare"] = [
+                {
+                    "method": step.method,
+                    "mode": step.mode,
+                    "bake_weights": step.bake_weights,
+                    **step.options,
+                }
+                for step in self.weight_prepare
+            ]
+        if self.weight_export:
+            meta_payload["weight_export"] = dict(self.weight_export)
 
     def _update_output_payload(self, out: Dict[str, Any]) -> None:
         out["sym"] = self.sym

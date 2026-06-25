@@ -1097,9 +1097,20 @@ class BaseQModel(nn.Module):
         else:
             from ..looper.gptq_processor import GPTQProcessor
 
-            quantize_processor = preprocessors + [
-                GPTQProcessor(**args),
-            ]
+            if getattr(self.quantize_config, "uses_ptq_transform_pipeline", None) and self.quantize_config.uses_ptq_transform_pipeline():
+                from ..looper.statistics_processor import StatisticsProcessor
+                from ..looper.transform_processor import TransformProcessor
+
+                ptq_args = dict(args)
+                quantize_processor = preprocessors + [
+                    StatisticsProcessor(**ptq_args),
+                    TransformProcessor(**ptq_args),
+                    GPTQProcessor(**args),
+                ]
+            else:
+                quantize_processor = preprocessors + [
+                    GPTQProcessor(**args),
+                ]
 
         if getattr(self.quantize_config, "gptaq", None) is not None:
             from ..looper.native_processor import NativeProcessor

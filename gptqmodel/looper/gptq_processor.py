@@ -400,6 +400,36 @@ class GPTQProcessor(LoopProcessor):
     # submodule_finalized is called in reverse after all next sequential processes are called
     def submodule_finalize(self, module: NamedModule, model: BaseQModel, **kwargs):
         """Creates the quantized module and packs the saved GPTQ tensors into it."""
+        export_payload = getattr(self.qcfg, "weight_export", None)
+        if export_payload:
+            from ..looper.transform_processor import PTQ_TRANSFORM_KEY
+            from ..ptq.config import ExportTargetConfig
+            from ..ptq.context import WeightQuantState
+            from ..ptq.export.gptq import GptqExport
+            from ..ptq.export.registry import build_export_backend
+
+            export_cfg = ExportTargetConfig(
+                format=str(export_payload.get("format", "gptq")),
+                impl=str(export_payload.get("impl", "default")),
+                options={k: v for k, v in export_payload.items() if k not in {"format", "impl"}},
+            )
+            export_backend = build_export_backend(export_cfg)
+            if not isinstance(export_backend, GptqExport):
+                transform = module.state.get(PTQ_TRANSFORM_KEY)
+                weight_quant = WeightQuantState(
+                    q_scales=module.state.get("q_scales", torch.empty(0)),
+                    q_zeros=module.state.get("q_zeros", torch.empty(0)),
+                    q_g_idx=module.state.get("q_g_idx"),
+                )
+                export_backend.pack_module(
+                    module_name=module.full_name,
+                    submodule=module,
+                    transform=transform,
+                    weight_quant=weight_quant,
+                    model=model,
+                )
+                module.state.pop(PTQ_TRANSFORM_KEY, None)
+                return
 
         # generate complete, safe to move to cpu
         # module.weight.data = move_to(module.state.pop("wq"), device=CPU) # large weights is slow to init on cpu
@@ -512,11 +542,12 @@ class GPTQProcessor(LoopProcessor):
 
     def verify_calibration_dataset(self, processor_index: int) -> bool:
         """Ensures GPTQ received calibration data before the quantization loop starts."""
-
+        del processor_index
+        if getattr(self.qcfg, "uses_ptq_transform_pipeline", None) and self.qcfg.uses_ptq_transform_pipeline():
+            return False
         if self.calibration_dataset is None:
             raise ValueError("GPTQProcessor's calibration_dataset must be provided.")
-        else:
-            return True
+        return True
 
     def name(self) -> str:
         """Returns `gptaq` when GPTAQ overrides are active, otherwise `gptq`."""

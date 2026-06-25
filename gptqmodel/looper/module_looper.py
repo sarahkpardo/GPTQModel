@@ -67,6 +67,8 @@ from .awq_processor import AWQProcessor
 from .forward_executor import ForwardExecutor
 from .paroquant_processor import ParoQuantProcessor
 from .qqq_processor import QQQProcessor
+from .statistics_processor import StatisticsProcessor
+from .transform_processor import TransformProcessor
 from .stage_inputs_capture import StageInputsCapture
 from .stage_layer import run_layer_stage
 
@@ -1443,7 +1445,16 @@ class ModuleLooper():
 
         for p_index, processor in enumerate(self.processors):
             if not processor.verify_calibration_dataset(p_index):
+                uses_ptq = getattr(
+                    getattr(self.gptq_model, "quantize_config", None),
+                    "uses_ptq_transform_pipeline",
+                    lambda: False,
+                )
+                if callable(uses_ptq):
+                    uses_ptq = uses_ptq()
                 if isinstance(processor, EoraProcessor) or\
+                        isinstance(processor, TransformProcessor) or\
+                        (isinstance(processor, GPTQProcessor) and uses_ptq) or\
                         (isinstance(processor, GPTQProcessor) and getattr(self.gptq_model.quantize_config, "gptaq", None) is not None) or\
                         (isinstance(processor, GPTQProcessor) and getattr(self.gptq_model.quantize_config, "foem", None) is not None):
                     prev_processor = self.processors[p_index - 1]
