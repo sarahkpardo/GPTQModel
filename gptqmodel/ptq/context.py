@@ -32,12 +32,18 @@ class WeightQuantState:
 
 @dataclass
 class ModuleCalibContext:
-    """Per-module calibration statistics and stage outputs."""
+    """Per-module calibration statistics and stage outputs.
+
+    ``nsamples`` is the observed activation row count captured for this module
+    (used for Hessian normalization). ``expected_calibration_tokens`` is the
+    global calibration token total from the dataset (diagnostics only).
+    """
 
     module_name: str
     columns: int
     rows: int
     nsamples: int = 0
+    expected_calibration_tokens: Optional[int] = None
     H: Optional[torch.Tensor] = None
     qr_R: Optional[torch.Tensor] = None
     row_buffer: Optional[torch.Tensor] = None

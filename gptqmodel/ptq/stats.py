@@ -284,7 +284,13 @@ class StatisticsCollector:
 
             return self.H, self.qr_R
 
-    def to_context(self, *, module_name: str, rows: int) -> "ModuleCalibContext":
+    def to_context(
+        self,
+        *,
+        module_name: str,
+        rows: int,
+        expected_calibration_tokens: Optional[int] = None,
+    ) -> "ModuleCalibContext":
         from .context import ModuleCalibContext
 
         self.finalize()
@@ -293,6 +299,7 @@ class StatisticsCollector:
             columns=self.columns,
             rows=rows,
             nsamples=self.nsamples,
+            expected_calibration_tokens=expected_calibration_tokens,
             H=self.H,
             qr_R=self.qr_R,
             row_buffer=self.row_buffer,

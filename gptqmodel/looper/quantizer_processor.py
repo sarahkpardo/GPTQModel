@@ -29,7 +29,8 @@ from ..models.writer import (
     QUANT_LOG_LOSS,
     QUANT_LOG_NSAMPLES,
 )
-from ..ptq.config import WeightQuantizeTargetConfig, resolve_calibration_nsamples, resolve_weight_quantize_target
+from ..ptq.calibration_coverage import expected_calibration_tokens
+from ..ptq.config import WeightQuantizeTargetConfig, resolve_weight_quantize_target
 from ..ptq.optimizers.registry import build_weight_optimizer, weight_optimizer_requires_calibration
 from ..quantization import FOEM, GPTAQ, GPTQ
 from ..quantization.config import FOEMConfig, GPTAQConfig, HessianConfig, METHOD, QuantizeConfig, resolve_quant_format
@@ -182,10 +183,7 @@ class QuantizerProcessor(LoopProcessor):
         else:
             tmp = GPTQ(module=module, qcfg=qcfg_clone)
         tmp.fallback = None
-        tmp.expected_nsamples = resolve_calibration_nsamples(
-            self.qcfg_dynamic or self.qcfg,
-            self,
-        )
+        tmp.expected_nsamples = expected_calibration_tokens(self)
 
         tmp.quantizer.configure(perchannel=True)
         self.tasks[module.name] = tmp
@@ -259,11 +257,11 @@ class QuantizerProcessor(LoopProcessor):
 
         if weight_optimizer_requires_calibration(self.weight_quantize):
             if ctx.nsamples <= 0:
-                expected_nsamples = resolve_calibration_nsamples(self.qcfg_dynamic or self.qcfg, self)
+                expected_tokens = expected_calibration_tokens(self)
                 raise ValueError(
                     f"Quantizer `{self.weight_quantize.method}` requires calibration statistics "
-                    f"for `{module.full_name}`, but observed nsamples={ctx.nsamples} "
-                    f"(configured nsamples={expected_nsamples})."
+                    f"for `{module.full_name}`, but observed_rows={ctx.nsamples} "
+                    f"(expected_calibration_tokens={expected_tokens})."
                 )
             if ctx.H is None:
                 raise ValueError(
@@ -283,7 +281,7 @@ class QuantizerProcessor(LoopProcessor):
             transform=transform,
             device=opt_device,
             qcfg=self.qcfg_dynamic or self.qcfg,
-            expected_nsamples=resolve_calibration_nsamples(self.qcfg_dynamic or self.qcfg, self),
+            expected_nsamples=expected_calibration_tokens(self),
         )
         duration = time.perf_counter() - start
 

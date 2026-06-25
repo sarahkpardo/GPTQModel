@@ -72,26 +72,6 @@ def normalize_transform_prepare(
     raise ValueError("GPTQConfig: `weight_prepare` must be a dict, list, or TransformPrepareConfig.")
 
 
-DEFAULT_CALIBRATION_NSAMPLES = 64
-
-
-def resolve_calibration_nsamples(qcfg, processor=None) -> int:
-    """Resolve the configured/observed calibration row budget for GPTQ/PTQ modules."""
-    hessian = getattr(qcfg, "hessian", None)
-    configured = getattr(hessian, "nsamples", None)
-    if configured is not None:
-        configured = int(configured)
-        if configured > 0:
-            return configured
-
-    if processor is not None:
-        observed = getattr(processor, "total_calibration_tokens", None)
-        if observed is not None and int(observed) > 0:
-            return int(observed)
-
-    return DEFAULT_CALIBRATION_NSAMPLES
-
-
 def resolve_weight_quantize_target(qcfg) -> WeightQuantizeTargetConfig:
     """Resolve the weight quantizer target from a QuantizeConfig."""
     raw = getattr(qcfg, "weight_quantize", None)

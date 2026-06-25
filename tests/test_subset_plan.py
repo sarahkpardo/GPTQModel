@@ -84,6 +84,33 @@ def test_build_subset_plan_skips_forward_for_no_forward_processor():
     assert plan.calibration_coverage_policy.validate_input_coverage is False
 
 
+def test_build_subset_plan_defers_outputs_when_replay_after_process():
+    looper = _make_looper()
+    processor = _StubProcessor(
+        ExecutionConfig(
+            require_fwd=True,
+            fwd_replay_after_process=True,
+            subset_forward_early_stop=True,
+        )
+    )
+    subset = {"attn.c_proj": _make_named_module("attn.c_proj")}
+
+    plan = build_subset_plan(
+        looper,
+        processor=processor,
+        subset=subset,
+        subset_index=1,
+        subset_total=4,
+        full=subset,
+        fallback=None,
+        layer_inputs=[[torch.zeros(1, 8, 4)]],
+    )
+
+    assert plan.execute_forward is True
+    assert plan.replay_after_process is True
+    assert plan.need_forward_outputs is False
+
+
 def test_subset_plan_for_modules_preserves_parent_ordered_module_names():
     modules = {
         "mlp.experts.0.gate_proj": _make_named_module("mlp.experts.0.gate_proj"),

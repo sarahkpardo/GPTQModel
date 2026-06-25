@@ -9,13 +9,31 @@ from typing import Callable, Dict, Optional, Tuple
 import torch
 from torch.nn import Module
 
-from ..looper.loop_processor import ExecutionConfig, LoopProcessor
+from ..looper.loop_processor import (
+    DTYPE_SIZE_COLUMN,
+    MODULE_FEATURE_COLUMN,
+    ExecutionConfig,
+    LoopProcessor,
+)
 from ..looper.named_module import NamedModule
 from ..models import BaseQModel
-from ..ptq.config import resolve_calibration_nsamples
+from ..models.writer import (
+    PROCESS_LOG_LAYER,
+    PROCESS_LOG_MODULE,
+    PROCESS_LOG_NAME,
+    QUANT_LOG_NSAMPLES,
+)
+from ..ptq.calibration_coverage import (
+    describe_calibration_coverage,
+    expected_calibration_tokens,
+    format_coverage_stat,
+)
 from ..ptq.stats import StatisticsCollector
 from ..quantization.config import QuantizeConfig
 from ..quantization.gptq import get_number_of_rows_and_cols
+from ..utils.logger import setup_logger
+
+log = setup_logger()
 
 PTQ_STATS_KEY = "ptq_stats_collector"
 PTQ_CONTEXT_KEY = "ptq_calib_context"
@@ -46,7 +64,7 @@ class StatisticsProcessor(LoopProcessor):
             batch_size=batch_size,
             execution_config=ExecutionConfig(
                 require_fwd=True,
-                fwd_replay_after_process=False,
+                fwd_replay_after_process=True,
                 subset_forward_early_stop=True,
             ),
         )
@@ -115,15 +133,44 @@ class StatisticsProcessor(LoopProcessor):
         if collector is None:
             return
         rows, _ = get_number_of_rows_and_cols(module)
-        ctx = collector.to_context(module_name=module.full_name, rows=rows)
-        expected_nsamples = resolve_calibration_nsamples(self.qcfg, self)
-        if ctx.nsamples <= 0:
+        expected_tokens = expected_calibration_tokens(self)
+        ctx = collector.to_context(
+            module_name=module.full_name,
+            rows=rows,
+            expected_calibration_tokens=expected_tokens,
+        )
+        observed_rows = ctx.nsamples
+        if observed_rows <= 0:
             raise ValueError(
                 f"Statistics capture collected 0 activation rows for `{module.full_name}` "
-                f"(configured nsamples={expected_nsamples}). Ensure the module receives "
-                f"calibration forwards before PTQ quantization."
+                f"(expected_calibration_tokens={expected_tokens}, observed_rows=0). "
+                f"Ensure the module receives calibration forwards before PTQ quantization."
             )
+        if observed_rows != expected_tokens:
+            log.warn(describe_calibration_coverage(
+                module_name=module.full_name,
+                observed_rows=observed_rows,
+                expected_tokens=expected_tokens,
+            ))
+
         module.state[PTQ_CONTEXT_KEY] = ctx
+
+        stat = {
+            PROCESS_LOG_NAME: self.name(),
+            PROCESS_LOG_LAYER: module.layer_index,
+            PROCESS_LOG_MODULE: module.name,
+            MODULE_FEATURE_COLUMN: self.module_feature_summary(module),
+            DTYPE_SIZE_COLUMN: self.module_dtype_size_summary(module),
+            QUANT_LOG_NSAMPLES: f"{observed_rows}",
+            "expected_calibration_tokens": str(expected_tokens),
+            "coverage": format_coverage_stat(
+                observed_rows=observed_rows,
+                expected_tokens=expected_tokens,
+            ),
+        }
+        with self.lock:
+            self.log.append(stat)
+        self.log_new_row(stat)
 
     def submodule_finalize(self, module: NamedModule, model: BaseQModel, **kwargs):
         del model, kwargs

@@ -13,7 +13,8 @@ from ..looper.loop_processor import ExecutionConfig, LoopProcessor
 from ..looper.named_module import NamedModule
 from ..looper.statistics_processor import PTQ_CONTEXT_KEY
 from ..models import BaseQModel
-from ..ptq.config import TransformPrepareConfig, normalize_transform_prepare, resolve_calibration_nsamples
+from ..ptq.calibration_coverage import expected_calibration_tokens
+from ..ptq.config import TransformPrepareConfig, normalize_transform_prepare
 from ..ptq.context import ModuleCalibContext, TransformState
 from ..ptq.transforms.registry import build_transform_backend
 from ..quantization.config import QuantizeConfig
@@ -96,16 +97,16 @@ class TransformProcessor(LoopProcessor):
         if not self.prepare_configs:
             return
         ctx: ModuleCalibContext | None = module.state.get(PTQ_CONTEXT_KEY)
-        expected_nsamples = resolve_calibration_nsamples(self.qcfg, self)
+        expected_tokens = expected_calibration_tokens(self)
         if ctx is None:
             raise ValueError(
                 f"Transform stage missing calibration context for `{module.full_name}` "
-                f"(configured nsamples={expected_nsamples})."
+                f"(expected_calibration_tokens={expected_tokens})."
             )
         if ctx.nsamples <= 0:
             raise ValueError(
                 f"Transform stage received empty calibration statistics for `{module.full_name}` "
-                f"(observed nsamples={ctx.nsamples}, configured nsamples={expected_nsamples})."
+                f"(observed_rows={ctx.nsamples}, expected_calibration_tokens={expected_tokens})."
             )
 
         weight = module.weight.data
