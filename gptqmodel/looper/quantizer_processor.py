@@ -628,5 +628,22 @@ class QuantizerProcessor(LoopProcessor):
 
     def has_captured_input_ids(self, name: str) -> bool:
         if self.capture_mode == "none":
-            return name in self._split_modules
-        return self.tasks[name].fwd_counter > 0
+            if name not in self._split_modules:
+                return False
+            collectors = getattr(self, "_collectors", None)
+            if isinstance(collectors, dict) and collectors:
+                by_short = getattr(self, "_collectors_by_short_name", None)
+                if isinstance(by_short, dict):
+                    collector = by_short.get(name)
+                    if collector is not None:
+                        return collector.nsamples > 0
+                for key, collector in collectors.items():
+                    if key == name or key.endswith(f".{name}"):
+                        return collector.nsamples > 0
+                return False
+            return True
+
+        task = self.tasks.get(name)
+        if task is None:
+            return False
+        return task.fwd_counter > 0

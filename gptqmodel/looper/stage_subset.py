@@ -952,10 +952,13 @@ def _run_single_subset_pass(
                     split_modules.pop(name, None)
                 collectors = getattr(processor, "_collectors", None)
                 collectors_by_id = getattr(processor, "_collectors_by_module_id", None)
+                collectors_by_short = getattr(processor, "_collectors_by_short_name", None)
                 if isinstance(collectors, dict):
                     collectors.pop(skipped_module.full_name, None)
                 if isinstance(collectors_by_id, dict):
                     collectors_by_id.pop(id(skipped_module.module), None)
+                if isinstance(collectors_by_short, dict):
+                    collectors_by_short.pop(name, None)
 
                 # No calibration data was routed to these MoE expert modules.
                 # We skip quantization them and record them in `qcfg.dynamic` as dynamically excluded modules.

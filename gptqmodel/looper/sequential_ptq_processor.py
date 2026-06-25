@@ -85,6 +85,7 @@ class SequentialPTQProcessor(QuantizerProcessor):
         )
         self._collectors: Dict[str, StatisticsCollector] = {}
         self._collectors_by_module_id: Dict[int, StatisticsCollector] = {}
+        self._collectors_by_short_name: Dict[str, StatisticsCollector] = {}
 
     @staticmethod
     def _collector_key(module: NamedModule) -> str:
@@ -113,6 +114,7 @@ class SequentialPTQProcessor(QuantizerProcessor):
         collector_key = self._collector_key(module)
         self._collectors[collector_key] = collector
         self._collectors_by_module_id[id(module.module)] = collector
+        self._collectors_by_short_name[module.name] = collector
         module.state[PTQ_STATS_KEY] = collector
 
         if not self.prepare_configs:
@@ -126,14 +128,19 @@ class SequentialPTQProcessor(QuantizerProcessor):
     def has_captured_input_ids(self, name: str) -> bool:
         if name not in self._split_modules:
             return False
-        for key, collector in self._collectors.items():
+        collector = self._collectors_by_short_name.get(name)
+        if collector is not None:
+            return collector.nsamples > 0
+        for key, candidate in self._collectors.items():
             if key == name or key.endswith(f".{name}"):
-                return collector.nsamples > 0
+                return candidate.nsamples > 0
         return False
 
     def pre_process_fwd_hook(self, name: str) -> Callable[[Module, Tuple[torch.Tensor, ...], torch.Tensor], None]:
         def hook(_module, inp: Tuple[torch.Tensor, ...], _out: torch.Tensor):
             collector = self._collectors_by_module_id.get(id(_module))
+            if collector is None:
+                collector = self._collectors_by_short_name.get(name)
             if collector is None:
                 module_key = getattr(_module, "module_name", None)
                 if module_key:
@@ -277,6 +284,7 @@ class SequentialPTQProcessor(QuantizerProcessor):
 
     def submodule_finalize(self, module: NamedModule, model: BaseQModel, **kwargs):
         self._collectors_by_module_id.pop(id(module.module), None)
+        self._collectors_by_short_name.pop(module.name, None)
         collector = self._collectors.pop(self._collector_key(module), None)
         if collector is not None:
             collector.free()
