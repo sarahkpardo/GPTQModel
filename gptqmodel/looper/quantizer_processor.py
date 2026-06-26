@@ -494,6 +494,37 @@ class QuantizerProcessor(LoopProcessor):
         if not self._preserve_pseudo_weight_for_replay(weight_quant_extra):
             module.weight.data = wq
 
+        if weight_quant_extra is not None:
+            with self.lock:
+                module.state["ptq_weight_quant_extra"] = dict(weight_quant_extra)
+
+    def _register_ptq_inference_hooks(
+        self,
+        module: NamedModule,
+        qmodule: Module,
+    ) -> None:
+        transform = module.state.get(PTQ_TRANSFORM_KEY)
+        if transform is None:
+            return
+
+        from ..ptq.inference_data import InferenceTransformData
+        from ..ptq.inference_hooks import register_activation_pre_hook
+
+        extra = module.state.pop("ptq_weight_quant_extra", None) or {}
+        inference = transform.inference
+        if inference is None:
+            raw = extra.get("inference_transform")
+            if isinstance(raw, InferenceTransformData):
+                inference = raw
+            elif isinstance(raw, dict):
+                inference = InferenceTransformData.from_dict(raw)
+
+        register_activation_pre_hook(qmodule, transform, inference=inference)
+        resolved = inference or transform.inference
+        if resolved is not None and not resolved.is_identity():
+            module.state["ptq_inference_transform"] = resolved.to_dict()
+        module.state.pop(PTQ_TRANSFORM_KEY, None)
+
     def submodule_finalize(self, module: NamedModule, model: BaseQModel, **kwargs):
         export_payload = getattr(self.qcfg, "weight_export", None)
         if export_payload:
@@ -606,6 +637,10 @@ class QuantizerProcessor(LoopProcessor):
                 time.perf_counter() - pack_start,
                 source=f"{module_label} [{packer_label or 'module.pack_original'}]",
             )
+
+        qmodule = qModules.get(module.full_name)
+        if qmodule is not None:
+            self._register_ptq_inference_hooks(module, qmodule)
 
         with self.lock:
             self.result_pop(module.full_name)

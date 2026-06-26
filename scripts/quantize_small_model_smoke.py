@@ -50,8 +50,9 @@ from gptqmodel import BACKEND, GPTQModel, QuantizeConfig  # noqa: E402
 
 PipelineMode = Literal["legacy", "ptq", "ptq-paroquant-moe"]
 ModelFixture = Literal["hf", "tiny-qwen3-moe"]
-WeightPrepareMode = Literal["identity", "paroquant"]
+WeightPrepareMode = Literal["identity", "paroquant", "random_orthogonal"]
 WeightExportMode = Literal["gptq", "paroquant"]
+WeightQuantizeMode = Literal["gptq", "rtn"]
 
 _DEFAULT_CALIBRATION = [
     "GPTQModel quantizes language models with calibration data.",
@@ -70,6 +71,7 @@ def _build_quantize_config(
     moe: bool = False,
     weight_prepare: WeightPrepareMode | None = None,
     weight_export: WeightExportMode | None = None,
+    weight_quantize: WeightQuantizeMode | None = None,
 ) -> QuantizeConfig:
     kwargs = dict(
         bits=bits,
@@ -86,6 +88,15 @@ def _build_quantize_config(
         weight_export = "paroquant"
     if pipeline == "ptq":
         kwargs["weight_prepare"] = [{"method": "identity"}]
+    if weight_prepare == "random_orthogonal":
+        kwargs["weight_prepare"] = [
+            {
+                "method": "random_orthogonal",
+                "group_size": group_size,
+                "opt_seed": 42,
+            }
+        ]
+        kwargs["weight_export"] = {"format": "gptq"}
     if weight_prepare == "paroquant":
         kwargs["weight_prepare"] = [
             {
@@ -103,6 +114,8 @@ def _build_quantize_config(
         kwargs["weight_quantize"] = {"method": "paroquant"}
     if weight_export == "paroquant":
         kwargs["weight_export"] = {"format": "paroquant"}
+    if weight_quantize in {"gptq", "rtn"}:
+        kwargs["weight_quantize"] = {"method": weight_quantize}
     if moe:
         from gptqmodel.quantization.config import ExpertsRoutingOverride, MoEConfig
 
@@ -194,6 +207,7 @@ def _run_pipeline_smoke(
     max_new_tokens: int,
     weight_prepare: WeightPrepareMode | None = None,
     weight_export: WeightExportMode | None = None,
+    weight_quantize: WeightQuantizeMode | None = None,
 ) -> list[int]:
     moe = model_fixture == "tiny-qwen3-moe"
     qcfg = _build_quantize_config(
@@ -204,6 +218,7 @@ def _run_pipeline_smoke(
         moe=moe,
         weight_prepare=weight_prepare,
         weight_export=weight_export,
+        weight_quantize=weight_quantize,
     )
     export_mode = weight_export
     if pipeline == "ptq-paroquant-moe":
@@ -279,9 +294,15 @@ def main() -> int:
     )
     parser.add_argument(
         "--weight-prepare",
-        choices=("identity", "paroquant"),
+        choices=("identity", "paroquant", "random_orthogonal"),
         default=None,
         help="Override PTQ weight_prepare (default: pipeline preset)",
+    )
+    parser.add_argument(
+        "--weight-quantize",
+        choices=("gptq", "rtn"),
+        default=None,
+        help="Override PTQ weight_quantize method (default: gptq)",
     )
     parser.add_argument(
         "--weight-export",
@@ -370,6 +391,7 @@ def main() -> int:
             max_new_tokens=args.max_new_tokens,
             weight_prepare=args.weight_prepare,
             weight_export=args.weight_export,
+            weight_quantize=args.weight_quantize,
         )
         if args.output_dir is not None:
             print(f"Checkpoint kept at {args.output_dir}")

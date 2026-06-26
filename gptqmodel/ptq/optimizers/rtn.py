@@ -24,7 +24,6 @@ def rtn_config_from_qcfg(qcfg) -> RTNConfig:
         format=getattr(qcfg, "format", FORMAT.GPTQ),
         device=getattr(qcfg, "device", None),
         smooth=getattr(qcfg, "smooth", None),
-        damp_percent=getattr(qcfg, "damp_percent", None),
         desc_act=getattr(qcfg, "desc_act", False),
         dynamic=getattr(qcfg, "dynamic", None),
         pack_dtype=getattr(qcfg, "pack_dtype", None),
@@ -47,8 +46,9 @@ class RtnWeightOptimizer:
         ctx: ModuleCalibContext,
         transform: TransformState | None,
         device: torch.device,
+        expected_nsamples: Optional[float] = None,
     ) -> WeightQuantState:
-        del ctx, transform, device
+        del ctx, transform, device, expected_nsamples
         rtn_cfg = rtn_config_from_qcfg(self.qcfg)
         rtn = RTN(module, rtn_cfg)
         wq, q_scales, q_zeros, q_g_idx, _duration, avg_loss, _damp, _nsamples = rtn.quantize()

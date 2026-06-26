@@ -35,10 +35,11 @@ def register_activation_pre_hook(
     *,
     inference: InferenceTransformData | None = None,
 ) -> Optional[Callable[..., None]]:
-    """Register ``T_X`` on ``module`` when transform weights are not baked."""
-    if transform is not None and transform.bake_weights:
-        return None
+    """Register online ``T_X`` when the inference payload is non-identity.
 
+    ``bake_weights=True`` only means ``T_W`` was applied offline; ``T_X`` still
+    runs at inference to preserve the bilinear inner product.
+    """
     inference_data = resolve_inference_transform(transform, inference=inference)
     if inference_data.is_identity():
         return None
