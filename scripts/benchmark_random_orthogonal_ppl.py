@@ -41,6 +41,7 @@ _require_runtime_deps()
 import torch  # noqa: E402
 
 from gptqmodel import BACKEND, GPTQModel, QuantizeConfig  # noqa: E402
+from gptqmodel.utils.moe_benchmark import configure_moe_quantize_config, is_moe_gptq_model  # noqa: E402
 from gptqmodel.utils.wikitext_benchmark import (  # noqa: E402
     compute_wikitext_perplexity,
     load_wikitext_calibration,
@@ -125,6 +126,9 @@ def _run_method(
 
     print(f"\n--- Quantizing ({weight_prepare} + gptq) ---")
     model = GPTQModel.load(model_id, **load_kwargs)
+    configure_moe_quantize_config(model, model.quantize_config)
+    if is_moe_gptq_model(model):
+        print("MoE: using ExpertsRoutingOverride for calibration routing.")
     quantize_kwargs = {
         "batch_size": batch_size,
         "calibration_data_min_length": 10,

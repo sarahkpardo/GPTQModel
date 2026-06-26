@@ -11,6 +11,8 @@ from ..base import BaseQModel
 class Qwen3MoeQModel(BaseQModel):
     require_monkeypatch = False
 
+    layer_modules_strict = False
+
     # allow dynamic expert index for layer_modules so we don't need to write out 64 layers here
     # config.num_experts contains the actual expert count used for index
     dynamic_expert_index = "num_experts"

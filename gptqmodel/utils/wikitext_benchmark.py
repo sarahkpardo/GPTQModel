@@ -37,6 +37,46 @@ def _unwrap_model(model: Union[nn.Module, Any]) -> nn.Module:
     raise TypeError(f"Expected nn.Module or GPTQModel wrapper, got {type(model)!r}")
 
 
+def _model_max_seq_len(module: nn.Module) -> int | None:
+    config = getattr(module, "config", None)
+    if config is None:
+        return None
+    for attr in ("max_position_embeddings", "n_positions", "seq_length"):
+        value = getattr(config, attr, None)
+        if isinstance(value, int) and value > 0:
+            return value
+    return None
+
+
+def _iter_wikitext_sequences(
+    tokenizer: PreTrainedTokenizerBase,
+    texts: list[str],
+    *,
+    seq_len: int,
+    max_seqs: int,
+) -> list[torch.Tensor]:
+    """Tokenize WikiText articles incrementally and pack fixed-length windows."""
+    buf: list[int] = []
+    seqs: list[torch.Tensor] = []
+    for text in texts:
+        if len(seqs) >= max_seqs:
+            break
+        stripped = text.strip()
+        if not stripped:
+            continue
+        ids = tokenizer(
+            stripped,
+            return_tensors="pt",
+            truncation=False,
+            add_special_tokens=False,
+        ).input_ids[0].tolist()
+        buf.extend(ids)
+        while len(buf) >= seq_len and len(seqs) < max_seqs:
+            seqs.append(torch.tensor(buf[:seq_len], dtype=torch.long))
+            buf = buf[seq_len:]
+    return seqs
+
+
 def load_wikitext_calibration(
     tokenizer: PreTrainedTokenizerBase,
     *,
@@ -117,24 +157,36 @@ def compute_wikitext_perplexity(
         return float("nan")
 
     data = load_dataset(WIKITEXT_DATASET, WIKITEXT_CONFIG, split=split)
-    text = "\n\n".join(data["text"])
-    tokens = tokenizer(text, return_tensors="pt").input_ids[0]
-    tokens = tokens[:n_tokens]
 
     module = _unwrap_model(model)
     module.eval()
-    total_nll = 0.0
-    n_seqs = len(tokens) // seq_len
-    if n_seqs == 0:
+
+    effective_seq_len = seq_len
+    max_model_len = _model_max_seq_len(module)
+    if max_model_len is not None and effective_seq_len > max_model_len:
+        effective_seq_len = max_model_len
+
+    max_seqs = n_tokens // effective_seq_len
+    if max_seqs <= 0:
         return float("nan")
 
-    for i in range(n_seqs):
-        chunk = tokens[i * seq_len : (i + 1) * seq_len].unsqueeze(0).to(device)
+    seqs = _iter_wikitext_sequences(
+        tokenizer,
+        data["text"],
+        seq_len=effective_seq_len,
+        max_seqs=max_seqs,
+    )
+    if not seqs:
+        return float("nan")
+
+    total_nll = 0.0
+    for seq in seqs:
+        chunk = seq.unsqueeze(0).to(device)
         with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
             out = module(chunk, labels=chunk)
         total_nll += out.loss.item()
 
-    return math.exp(total_nll / n_seqs)
+    return math.exp(total_nll / len(seqs))
 
 
 def mean_quant_loss(quantize_result: dict[str, list[dict[str, str]]]) -> float | None:

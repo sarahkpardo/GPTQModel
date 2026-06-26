@@ -18,6 +18,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from gptqmodel import BACKEND, GPTQModel, QuantizeConfig  # noqa: E402
+from gptqmodel.utils.moe_benchmark import configure_moe_quantize_config  # noqa: E402
 from gptqmodel.utils.wikitext_benchmark import (  # noqa: E402
     compute_wikitext_perplexity,
     load_wikitext_calibration,
@@ -86,6 +87,7 @@ def test_wikitext_quantize_reload_perplexity(tmp_path: Path, weight_prepare: str
 
     qcfg = _build_quantize_config(weight_prepare=weight_prepare)
     model = GPTQModel.load(model_id, quantize_config=qcfg, backend=BACKEND.TORCH)
+    configure_moe_quantize_config(model, model.quantize_config)
     calibration = load_wikitext_calibration(
         model.tokenizer,
         max_samples=_CALIB_SAMPLES,
