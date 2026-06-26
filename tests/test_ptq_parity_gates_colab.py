@@ -17,6 +17,7 @@ COLAB_PARITY_COMMANDS = [
     "python scripts/quantize_small_model_smoke.py --model-fixture tiny-qwen3-moe --device cpu --pipeline ptq --weight-prepare random_orthogonal --weight-quantize gptq --check-parity",
     "python scripts/quantize_small_model_smoke.py --model-id gpt2 --device cuda --pipeline ptq --weight-prepare random_orthogonal --weight-quantize gptq --check-parity",
     "python scripts/quantize_small_model_smoke.py --model-fixture tiny-qwen3-moe --device cuda --pipeline ptq --weight-prepare random_orthogonal --weight-quantize gptq --check-parity",
+    "python scripts/benchmark_random_orthogonal_ppl.py --model-id $GPTQMODEL_BENCHMARK_MODEL_ID --calib-samples 64 --eval-n-tokens 16384",
 ]
 
 

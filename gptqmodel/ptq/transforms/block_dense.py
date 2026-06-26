@@ -77,18 +77,21 @@ def generate_random_orthogonal_blocks(
         )
         return [], empty
 
+    # QR sampling is always CPU-seeded for cross-device reproducibility; blocks are
+    # moved to the target device only when applied to weights/Hessian.
     generator = torch.Generator(device="cpu").manual_seed(int(seed))
+    cpu_device = torch.device("cpu")
     t_w_blocks: List[torch.Tensor] = []
     t_x_blocks: List[torch.Tensor] = []
     for _ in range(num_blocks):
         q = random_orthogonal_block(
             block_size,
             generator=generator,
-            device=device,
+            device=cpu_device,
             dtype=compute_dtype,
         )
-        t_w_blocks.append(q.detach().cpu())
-        t_x_blocks.append(q.T.to(dtype=inference_dtype).detach().cpu())
+        t_w_blocks.append(q.detach())
+        t_x_blocks.append(q.T.to(dtype=inference_dtype).detach())
 
     t_x_matrices = torch.stack(t_x_blocks, dim=2)
     return t_w_blocks, t_x_matrices

@@ -54,6 +54,7 @@ ModelFixture = Literal["hf", "tiny-qwen3-moe"]
 WeightPrepareMode = Literal["identity", "paroquant", "random_orthogonal"]
 WeightExportMode = Literal["gptq", "paroquant"]
 WeightQuantizeMode = Literal["gptq", "rtn"]
+CalibrationSource = Literal["strings", "wikitext"]
 
 _DEFAULT_CALIBRATION = [
     "GPTQModel quantizes language models with calibration data.",
@@ -71,11 +72,32 @@ _RANDOM_ORTHOGONAL_CALIBRATION = [
     "GPTQ uses the transformed Hessian after offline weight rotation during quantization.",
 ] * 8
 
+_PAROQUANT_CALIBRATION = [
+    "tiny moe paroquant ptq calibration sample one with enough tokens to survive minimum length filtering",
+    "tiny moe paroquant ptq calibration sample two with repeated expert words for routing override",
+    "tiny moe paroquant ptq calibration sample three exercises all expert gate projections",
+    "tiny moe paroquant ptq calibration sample four provides additional activation statistics",
+] * 4
+
 
 def _resolve_calibration(weight_prepare: WeightPrepareMode | None) -> list[str]:
     if weight_prepare == "random_orthogonal":
         return list(_RANDOM_ORTHOGONAL_CALIBRATION)
+    if weight_prepare == "paroquant":
+        return list(_PAROQUANT_CALIBRATION)
     return list(_DEFAULT_CALIBRATION)
+
+
+def _load_wikitext_calibration(tokenizer, *, max_samples: int) -> list[str]:
+    from gptqmodel.utils.wikitext_benchmark import load_wikitext_calibration
+
+    samples = load_wikitext_calibration(
+        tokenizer,
+        max_samples=max_samples,
+        min_length=10,
+        concat_size=0,
+    )
+    return list(samples)
 
 
 def _build_quantize_config(
@@ -274,7 +296,7 @@ def _run_pipeline_smoke(
     work_dir: Path,
     pipeline: PipelineMode,
     output_dir: Path,
-    calibration: list[str],
+    calibration: list[str] | None,
     bits: int,
     group_size: int,
     batch_size: int,
@@ -285,6 +307,9 @@ def _run_pipeline_smoke(
     weight_export: WeightExportMode | None = None,
     weight_quantize: WeightQuantizeMode | None = None,
     check_parity: bool = False,
+    calibration_source: CalibrationSource = "strings",
+    calib_samples: int = 128,
+    calib_concat_size: int = 0,
 ) -> list[int]:
     moe = model_fixture == "tiny-qwen3-moe"
     qcfg = _build_quantize_config(
@@ -319,11 +344,19 @@ def _run_pipeline_smoke(
         load_kwargs["backend"] = quantize_backend
     model = GPTQModel.load(model_source, **load_kwargs)
 
+    if calibration_source == "wikitext":
+        calibration = _load_wikitext_calibration(model.tokenizer, max_samples=calib_samples)
+        print(f"Loaded {len(calibration)} WikiText train calibration sample(s).")
+    elif calibration is None:
+        calibration = _resolve_calibration(weight_prepare)
+
     print("Quantizing...")
     quantize_kwargs = {
         "batch_size": batch_size,
-        "calibration_data_min_length": 1,
+        "calibration_data_min_length": 10 if calibration_source == "wikitext" else 1,
     }
+    if calib_concat_size > 0:
+        quantize_kwargs["calibration_concat_size"] = calib_concat_size
     if quantize_backend is not None:
         quantize_kwargs["backend"] = quantize_backend
     model.quantize(calibration, **quantize_kwargs)
@@ -412,6 +445,24 @@ def main() -> int:
         action="store_true",
         help="Run legacy and ptq pipelines and compare generated token ids.",
     )
+    parser.add_argument(
+        "--calibration-source",
+        choices=("strings", "wikitext"),
+        default="strings",
+        help="Calibration data source (default: built-in strings).",
+    )
+    parser.add_argument(
+        "--calib-samples",
+        type=int,
+        default=128,
+        help="Max WikiText train articles when --calibration-source=wikitext.",
+    )
+    parser.add_argument(
+        "--calib-concat-size",
+        type=int,
+        default=0,
+        help="Optional calibration_concat_size passed to quantize() for WikiText packing.",
+    )
     args = parser.parse_args()
     if args.model_fixture == "tiny-qwen3-moe" and args.group_size == 128:
         args.group_size = 32
@@ -425,7 +476,18 @@ def main() -> int:
     if args.compare and args.pipeline != "legacy":
         print("Note: --compare runs both legacy and ptq; ignoring --pipeline.", file=sys.stderr)
 
-    calibration = _resolve_calibration(args.weight_prepare)
+    calibration = None if args.calibration_source == "wikitext" else _resolve_calibration(args.weight_prepare)
+    if args.calibration_source == "wikitext":
+        print(
+            f"Using WikiText train calibration (max_samples={args.calib_samples}).",
+            file=sys.stderr,
+        )
+    elif args.weight_prepare in {"random_orthogonal", "paroquant"}:
+        print(
+            f"Using {args.weight_prepare} calibration: {len(calibration)} text(s), "
+            f"first={calibration[0]!r}",
+            file=sys.stderr,
+        )
 
     with tempfile.TemporaryDirectory(prefix="gptqmodel-smoke-") as tmp_root:
         tmp_path = Path(tmp_root)
@@ -443,6 +505,9 @@ def main() -> int:
                 device=args.device,
                 prompt=args.prompt,
                 max_new_tokens=args.max_new_tokens,
+                calibration_source=args.calibration_source,
+                calib_samples=args.calib_samples,
+                calib_concat_size=args.calib_concat_size,
             )
             ptq_tokens = _run_pipeline_smoke(
                 model_id=args.model_id,
@@ -457,6 +522,9 @@ def main() -> int:
                 device=args.device,
                 prompt=args.prompt,
                 max_new_tokens=args.max_new_tokens,
+                calibration_source=args.calibration_source,
+                calib_samples=args.calib_samples,
+                calib_concat_size=args.calib_concat_size,
             )
             if legacy_tokens == ptq_tokens:
                 print("PASS: legacy and PTQ pipelines produced identical token ids.")
@@ -484,6 +552,9 @@ def main() -> int:
             weight_export=args.weight_export,
             weight_quantize=args.weight_quantize,
             check_parity=args.check_parity,
+            calibration_source=args.calibration_source,
+            calib_samples=args.calib_samples,
+            calib_concat_size=args.calib_concat_size,
         )
         if args.output_dir is not None:
             print(f"Checkpoint kept at {args.output_dir}")
