@@ -33,8 +33,8 @@ from ..ptq.calibration_coverage import (
 )
 from ..ptq.config import TransformPrepareConfig, WeightQuantizeTargetConfig, normalize_transform_prepare
 from ..ptq.context import ModuleCalibContext, TransformState
+from ..ptq.pipeline import ModuleQuantizationPipeline
 from ..ptq.stats import StatisticsCollector
-from ..ptq.transforms.registry import build_transform_backend
 from ..quantization.config import QuantizeConfig
 from ..quantization.gptq import get_number_of_rows_and_cols
 from ..utils.device import get_device
@@ -82,6 +82,11 @@ class SequentialPTQProcessor(QuantizerProcessor):
         )
         self.prepare_configs = normalize_transform_prepare(
             prepare_configs or getattr(qcfg, "weight_prepare", None)
+        )
+        self._pipeline = ModuleQuantizationPipeline(
+            qcfg=qcfg,
+            prepare_configs=self.prepare_configs,
+            weight_quantize=weight_quantize,
         )
         self._collectors: Dict[str, StatisticsCollector] = {}
         self._collectors_by_module_id: Dict[int, StatisticsCollector] = {}
@@ -231,41 +236,20 @@ class SequentialPTQProcessor(QuantizerProcessor):
                 f"(observed_rows={ctx.nsamples}, expected_calibration_tokens={expected_tokens})."
             )
 
-        weight = module.weight.data
+        opt_device = device or get_device(module.module) or get_device(module)
         bias = getattr(module.module, "bias", None)
         if bias is not None:
             bias = bias.data
-        opt_device = device or get_device(module.module) or get_device(module)
-
-        transform_state = TransformState(method="identity", bake_weights=True)
-        qcfg_options = {
-            "bits": self.qcfg.bits,
-            "group_size": self.qcfg.group_size,
-            "sym": self.qcfg.sym,
-        }
-        for cfg in self.prepare_configs:
-            merged_options = {**qcfg_options, **cfg.options}
-            merged_cfg = TransformPrepareConfig(
-                method=cfg.method,
-                mode=cfg.mode,
-                bake_weights=cfg.bake_weights,
-                options=merged_options,
-            )
-            backend = build_transform_backend(merged_cfg)
-            transform_state = backend.fit(
-                weight=weight,
-                bias=bias,
-                ctx=ctx,
-                mode=cfg.mode if cfg.mode in {"standalone", "e2e"} else "standalone",
-                device=opt_device,
-            )
-            if transform_state.bake_weights:
-                weight = backend.apply_to_weights(weight, transform_state, device=opt_device)
-                module.weight.data = weight
-
+        weight, transform_state = self._pipeline.apply_transform(
+            module=module.module,
+            weight=module.weight.data,
+            bias=bias,
+            ctx=ctx,
+            device=opt_device,
+        )
+        module.weight.data = weight
         module.state[PTQ_TRANSFORM_KEY] = transform_state
         module.state.pop("_ptq_prepare_pending", None)
-        ctx.transform = transform_state
         module.state[PTQ_CONTEXT_KEY] = ctx
 
     def process(

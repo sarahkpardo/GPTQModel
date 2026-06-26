@@ -8,6 +8,7 @@ import torch.nn as nn
 
 from ..config import ExportTargetConfig
 from ..context import TransformState, WeightQuantState
+from ..inference_data import InferenceTransformData
 
 
 class FpQuantExport:
@@ -28,8 +29,10 @@ class FpQuantExport:
         submodule: nn.Module,
         transform: TransformState | None,
         weight_quant: WeightQuantState,
+        inference: InferenceTransformData | None = None,
         model: nn.Module,
     ) -> None:
+        del inference
         try:
             from fp_quant import FPQuantConfig, replace_with_fp_quant_linear  # type: ignore
         except ImportError:

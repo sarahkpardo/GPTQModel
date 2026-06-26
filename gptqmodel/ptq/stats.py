@@ -13,11 +13,13 @@ import torch
 from ..quantization.config import HessianConfig
 from ..quantization.qr_gptq_linalg import merge_qr_factors, update_qr_factor
 from ..utils.torch import torch_sync
-
-# Reuse GPTQ workspace leasing for chunked materialization.
-from ..quantization.gptq import (  # noqa: E402
-    _device_supports_bfloat16,
-    _lease_workspace,
+from .hessian_core import (
+    borrow_materialized_chunk_fp32,
+    compute_hessian_xtx as core_compute_hessian_xtx,
+    device_supports_bfloat16,
+    lease_workspace,
+    preferred_staging_dtype,
+    resolve_hessian_chunk_size,
 )
 
 
@@ -69,91 +71,18 @@ class StatisticsCollector:
         return getattr(self.hessian, "factorization", "cholesky") == "qr"
 
     def preferred_staging_dtype(self, input_dtype: torch.dtype, device: torch.device) -> torch.dtype:
-        staging_dtype = self.hessian.staging_dtype
-        if staging_dtype == torch.float32:
-            return torch.float32
-        if input_dtype not in (torch.float16, torch.bfloat16):
-            return torch.float32
-        if staging_dtype == torch.bfloat16:
-            if not _device_supports_bfloat16(device):
-                return torch.float32
-            return torch.bfloat16
-        if staging_dtype == torch.float16:
-            return torch.float16
-        return torch.float32
+        return preferred_staging_dtype(self.hessian, input_dtype, device)
 
     def resolve_hessian_chunk_size(self, rows: int, stage_dtype: torch.dtype) -> Optional[int]:
-        if rows == 0:
-            return None
-        cfg_chunk = self.hessian.chunk_size
-        if cfg_chunk is not None:
-            return max(1, min(cfg_chunk, rows))
-        bytes_budget = self.hessian.chunk_bytes
-        if bytes_budget is not None:
-            bytes_per_row = self.columns * torch.tensor([], dtype=stage_dtype).element_size()
-            if bytes_per_row > 0:
-                chunk_rows = bytes_budget // bytes_per_row
-                if chunk_rows > 0:
-                    return max(1, min(int(chunk_rows), rows))
-            return 1
-        return None
+        return resolve_hessian_chunk_size(self.hessian, self.columns, rows, stage_dtype)
 
     @contextlib.contextmanager
     def _borrow_materialized_chunk_fp32(self, chunk: torch.Tensor, rows: int):
-        if rows == 0:
-            yield chunk.new_zeros((0, self.columns), dtype=torch.float32)
-            return
-
-        device = chunk.device
-        stage_dtype = self.preferred_staging_dtype(chunk.dtype, device)
-        with _lease_workspace(device, stage_dtype, self.columns, rows) as (
-            staging_workspace,
-            staging_reused,
-        ):
-            staging_view = staging_workspace[:rows, :]
-            staging_view.copy_(chunk.to(dtype=stage_dtype))
-            if stage_dtype == torch.float32:
-                try:
-                    yield staging_view
-                finally:
-                    if device.type == "cuda":
-                        torch.cuda.current_stream(device).synchronize()
-            else:
-                with _lease_workspace(device, torch.float32, self.columns, rows) as (
-                    fp32_workspace,
-                    _fp32_reused,
-                ):
-                    fp32_view = fp32_workspace[:rows, :]
-                    fp32_view.copy_(staging_view.to(torch.float32))
-                    try:
-                        yield fp32_view
-                    finally:
-                        if device.type == "cuda":
-                            torch.cuda.current_stream(device).synchronize()
+        with borrow_materialized_chunk_fp32(self.hessian, self.columns, chunk, rows) as materialized:
+            yield materialized
 
     def compute_hessian_xtx(self, matrix: torch.Tensor) -> torch.Tensor:
-        rows = matrix.shape[0]
-        if rows == 0:
-            return torch.zeros((self.columns, self.columns), dtype=torch.float32, device=matrix.device)
-
-        stage_dtype = self.preferred_staging_dtype(matrix.dtype, matrix.device)
-        chunk_size = self.resolve_hessian_chunk_size(rows, stage_dtype)
-
-        if chunk_size is None:
-            mat32 = matrix.to(dtype=torch.float32)
-            xtx = torch.matmul(mat32.T, mat32)
-            del mat32
-            torch_sync(device=xtx.device)
-            return xtx
-
-        xtx_accum = torch.zeros((self.columns, self.columns), dtype=torch.float32, device=matrix.device)
-        for start in range(0, rows, chunk_size):
-            rows_this = min(chunk_size, rows - start)
-            source = matrix[start : start + rows_this]
-            with self._borrow_materialized_chunk_fp32(source, rows_this) as materialized:
-                xtx_accum.add_(torch.matmul(materialized.T, materialized))
-        torch_sync(device=xtx_accum.device)
-        return xtx_accum
+        return core_compute_hessian_xtx(self.hessian, self.columns, matrix)
 
     def _update_qr_from_matrix(self, matrix: torch.Tensor, device: torch.device) -> None:
         rows = matrix.shape[0]
@@ -171,6 +100,28 @@ class StatisticsCollector:
                 with self._borrow_materialized_chunk_fp32(source, rows_this) as materialized:
                     R = update_qr_factor(R, materialized)
         self._device_qr_partials[device] = R
+
+    def accumulate_partial(
+        self,
+        *,
+        xtx: torch.Tensor,
+        device: torch.device,
+        batch_rows: int,
+        activation_matrix: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Merge one batch contribution into streaming partials (legacy GPTQ path)."""
+        retain_qr = self._uses_qr_factorization()
+        with self._lock:
+            existing = self._device_hessian_partials.get(device)
+            if existing is None:
+                self._device_hessian_partials[device] = xtx
+            else:
+                existing.add_(xtx)
+            if retain_qr and activation_matrix is not None:
+                self._update_qr_from_matrix(activation_matrix, device)
+            self._device_sample_counts[device] = self._device_sample_counts.get(device, 0) + batch_rows
+            self.nsamples += batch_rows
+            self._hessian_dirty = True
 
     def _append_row_buffer(self, rows: torch.Tensor) -> None:
         if self.row_buffer_max_rows <= 0 or rows.numel() == 0:
@@ -225,18 +176,14 @@ class StatisticsCollector:
             dev = torch.device(reshaped.device)
             del reshaped
 
-        with self._lock:
-            existing = self._device_hessian_partials.get(dev)
-            if existing is None:
-                self._device_hessian_partials[dev] = xtx
-            else:
-                existing.add_(xtx)
-            if retain_qr and activation_matrix is not None:
-                self._update_qr_from_matrix(activation_matrix, dev)
-                del activation_matrix
-            self._device_sample_counts[dev] = self._device_sample_counts.get(dev, 0) + batch_rows
-            self.nsamples += batch_rows
-            self._hessian_dirty = True
+        self.accumulate_partial(
+            xtx=xtx,
+            device=dev,
+            batch_rows=batch_rows,
+            activation_matrix=activation_matrix,
+        )
+        if retain_qr and activation_matrix is not None:
+            del activation_matrix
 
         rows_for_buffer = inp.reshape(-1, inp.shape[-1]).contiguous()
         if rows_for_buffer.shape[-1] != self.columns:
@@ -322,3 +269,7 @@ class StatisticsCollector:
 
 # Protocol-facing alias for the Chen et al. / GPTQ Hessian accumulation stage.
 HessianAccumulator = StatisticsCollector
+
+# Backward-compatible re-exports for legacy GPTQ imports.
+_lease_workspace = lease_workspace
+_device_supports_bfloat16 = device_supports_bfloat16

@@ -57,6 +57,16 @@ class GptqWeightOptimizer:
             expected_nsamples=expected_nsamples,
         )
 
+        inference_transform = None
+        if transform is not None:
+            inference_transform = transform.inference
+            if inference_transform is None and not transform.bake_weights:
+                from ..transforms.registry import build_transform_backend
+                from ..config import TransformPrepareConfig
+
+                backend = build_transform_backend(TransformPrepareConfig(method=transform.method))
+                inference_transform = backend.get_inference_data(transform)
+
         return WeightQuantState(
             q_scales=result.q_scales,
             q_zeros=result.q_zeros,
@@ -68,5 +78,6 @@ class GptqWeightOptimizer:
                 "duration": result.duration,
                 "damp": result.damp,
                 "nsamples": result.nsamples,
+                "inference_transform": inference_transform,
             },
         )

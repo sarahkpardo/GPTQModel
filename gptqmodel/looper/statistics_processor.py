@@ -1,9 +1,16 @@
 # SPDX-FileCopyrightText: 2026 ModelCloud.ai
 # SPDX-License-Identifier: Apache-2.0
-"""Capture per-module calibration statistics for the PTQ pipeline."""
+"""Capture per-module calibration statistics for the PTQ pipeline.
+
+.. deprecated::
+    Do not wire this as a standalone looper pass. Use
+    :class:`gptqmodel.looper.sequential_ptq_processor.SequentialPTQProcessor`
+    for paper-aligned per-module capture instead.
+"""
 
 from __future__ import annotations
 
+import warnings
 from typing import Callable, Dict, Optional, Tuple
 
 import torch
@@ -53,6 +60,12 @@ class StatisticsProcessor(LoopProcessor):
         batch_size: int,
         calibration_concat_separator: Optional[str] = None,
     ):
+        warnings.warn(
+            "StatisticsProcessor is deprecated and must not be wired as a standalone "
+            "looper pass; use SequentialPTQProcessor instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         kwargs = dict(
             tokenizer=tokenizer,
             qcfg=qcfg,

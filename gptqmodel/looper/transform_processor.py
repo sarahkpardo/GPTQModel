@@ -1,9 +1,15 @@
 # SPDX-FileCopyrightText: 2026 ModelCloud.ai
 # SPDX-License-Identifier: Apache-2.0
-"""Apply configured transform backends before weight quantization."""
+"""Apply configured transform backends before weight quantization.
+
+.. deprecated::
+    Do not wire this as a standalone looper pass. Use
+    :class:`gptqmodel.looper.sequential_ptq_processor.SequentialPTQProcessor`.
+"""
 
 from __future__ import annotations
 
+import warnings
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -38,6 +44,12 @@ class TransformProcessor(LoopProcessor):
         prepare_configs: Optional[List[TransformPrepareConfig]] = None,
         calibration_concat_separator: Optional[str] = None,
     ):
+        warnings.warn(
+            "TransformProcessor is deprecated and must not be wired as a standalone "
+            "looper pass; use SequentialPTQProcessor instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         super().__init__(
             tokenizer=tokenizer,
             qcfg=qcfg,

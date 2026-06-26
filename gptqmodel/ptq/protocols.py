@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 
 from .context import ModuleCalibContext, TransformState, WeightQuantState
+from .inference_data import InferenceTransformData
 
 
 TransformMode = Literal["standalone", "e2e"]
@@ -36,6 +37,14 @@ class TransformBackend(Protocol):
         *,
         device: torch.device,
     ) -> torch.Tensor: ...
+
+    def transform_hessian(self, H: torch.Tensor, state: TransformState) -> torch.Tensor:
+        """Rotate or re-express Hessian after a weight-side transform."""
+        ...
+
+    def get_inference_data(self, state: TransformState) -> InferenceTransformData:
+        """Pack kernel-facing activation transform metadata."""
+        ...
 
     def activation_pre_hook(self, state: TransformState) -> Callable[..., None]:
         """Return a hook applying T_X at inference when transform is not baked."""
@@ -67,5 +76,6 @@ class ExportBackend(Protocol):
         submodule: nn.Module,
         transform: TransformState | None,
         weight_quant: WeightQuantState,
+        inference: InferenceTransformData | None = None,
         model: nn.Module,
     ) -> None: ...

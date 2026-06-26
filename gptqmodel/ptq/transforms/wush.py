@@ -35,3 +35,13 @@ class WUSHTransform(IdentityTransform):
 
     def activation_pre_hook(self, state: TransformState) -> Callable[..., None]:
         return super().activation_pre_hook(state)
+
+    def transform_hessian(self, H: torch.Tensor, state: TransformState) -> torch.Tensor:
+        del state
+        raise NotImplementedError("WUSH transform_hessian is not implemented yet.")
+
+    def get_inference_data(self, state: TransformState) -> "InferenceTransformData":
+        from ..inference_data import InferenceTransformData
+
+        del state
+        return InferenceTransformData(transform_type="wush")

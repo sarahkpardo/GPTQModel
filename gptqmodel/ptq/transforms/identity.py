@@ -8,6 +8,7 @@ from typing import Callable
 import torch
 
 from ..context import ModuleCalibContext, TransformState
+from ..inference_data import InferenceTransformData
 from ..protocols import TransformMode
 
 
@@ -35,6 +36,14 @@ class IdentityTransform:
     ) -> torch.Tensor:
         del state, device
         return weight
+
+    def transform_hessian(self, H: torch.Tensor, state: TransformState) -> torch.Tensor:
+        del state
+        return H
+
+    def get_inference_data(self, state: TransformState) -> InferenceTransformData:
+        del state
+        return InferenceTransformData(transform_type="identity")
 
     def activation_pre_hook(self, state: TransformState) -> Callable[..., None]:
         del state

@@ -41,112 +41,18 @@ from .qr_gptq_linalg import (
     qr_hessian_inverse,
     update_qr_factor,
 )
+from ..ptq.hessian_core import device_supports_bfloat16, lease_workspace
+from ..ptq.module_shape import get_number_of_rows_and_cols
+from ..ptq.solvers.hessian import compute_hessian_inverse
+from ..ptq.stats import StatisticsCollector
 from .quantizer import HF_OPTIMUM, Quantizer
+
+# Backward-compatible aliases for modules that imported these from gptq.
+_lease_workspace = lease_workspace
+_device_supports_bfloat16 = device_supports_bfloat16
 
 
 log = setup_logger()
-
-lock = threading.Lock()
-
-# Shared workspaces are cached globally per device so that concurrent GPTQ
-# instances reuse temporary buffers instead of repeatedly allocating large
-# tensors during Hessian accumulation. Each device retains at most a single
-# workspace; when size or dtype requirements change, the prior buffer is
-# discarded to avoid unbounded cache growth.
-_WORKSPACE_CACHE: Dict[Tuple[str, Optional[int]], torch.Tensor] = {}
-_WORKSPACE_LOCKS: Dict[Tuple[str, Optional[int]], threading.Lock] = {}
-_BF16_SUPPORT_CACHE: Dict[Tuple[str, Optional[int]], bool] = {}
-
-
-def _device_cache_key(device: torch.device) -> Tuple[str, Optional[int]]:
-    dev = torch.device(device)
-    return dev.type, dev.index
-
-
-def _workspace_cache_key(device: torch.device) -> Tuple[str, Optional[int]]:
-    return _device_cache_key(device)
-
-
-def _needs_workspace_resize(
-    workspace: Optional[torch.Tensor],
-    dtype: torch.dtype,
-    required_rows: int,
-    cols: int,
-) -> bool:
-    if workspace is None:
-        return True
-    if workspace.ndim != 2:
-        return True
-    if workspace.dtype != dtype:
-        return True
-    if workspace.shape[1] != cols:
-        return True
-    if workspace.shape[0] < required_rows:
-        return True
-    return False
-
-
-@contextlib.contextmanager
-def _lease_workspace(
-    device: torch.device,
-    dtype: torch.dtype,
-    cols: int,
-    required_rows: int,
-) -> Tuple[torch.Tensor, bool]:
-    key = _workspace_cache_key(device)
-    lock = _WORKSPACE_LOCKS.setdefault(key, threading.Lock())
-    with lock:
-        workspace = _WORKSPACE_CACHE.pop(key, None)
-        reused = workspace is not None and not _needs_workspace_resize(
-            workspace,
-            dtype,
-            required_rows,
-            cols,
-        )
-        if not reused:
-            rows = max(required_rows, 1)
-            workspace = torch.empty((rows, cols), dtype=dtype, device=device)
-    try:
-        yield workspace, reused
-    finally:
-        with lock:
-            _WORKSPACE_CACHE[key] = workspace
-
-
-def _device_supports_bfloat16(device: torch.device) -> bool:
-    cache_key = _device_cache_key(device)
-    cached = _BF16_SUPPORT_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
-
-    dev = torch.device(device)
-    if dev.type == "meta":
-        _BF16_SUPPORT_CACHE[cache_key] = False
-        return False
-
-    try:
-        a = torch.zeros((1, 1), dtype=torch.bfloat16, device=dev)
-        b = torch.zeros((1, 1), dtype=torch.bfloat16, device=dev)
-        _ = torch.matmul(a, b)
-        support = True
-    except Exception:
-        support = False
-
-    _BF16_SUPPORT_CACHE[cache_key] = support
-    return support
-
-
-def get_number_of_rows_and_cols(layer: nn.Module):
-    # return layer.weight.shape[0], np.prod(layer.weight.shape[1:])
-    if isinstance(layer, NamedModule):
-        layer = layer.module
-
-    if isinstance(layer, transformers.Conv1D):
-        # transformers.Conv1D: weight shape is (n_in, n_out)
-        return layer.weight.shape[1], layer.weight.shape[0]
-    else:
-        # weight shape is (n_out, n_in)
-        return layer.weight.shape[0], np.prod(layer.weight.shape[1:])
 
 
 class GPTQ:
@@ -238,6 +144,12 @@ class GPTQ:
         self._device_qr_partials: Dict[torch.device, torch.Tensor] = {}
         self._qr_R: Optional[torch.Tensor] = None
         self._hessian_dirty: bool = False
+        self._stats_collector = StatisticsCollector(
+            columns=self.columns,
+            hessian=self.qcfg.hessian,
+            row_buffer_max_rows=0,
+            stats_device=self._final_hessian_device_hint,
+        )
 
         self._borrow_workspace_stats = {
             "requests": 0,
@@ -374,21 +286,16 @@ class GPTQ:
 
         with self.lock:
             self.fwd_counter += 1
-
-            existing = self._device_hessian_partials.get(dev)
-            if existing is None:
-                self._device_hessian_partials[dev] = xtx
-            else:
-                existing.add_(xtx)
-                del xtx
-
-            if retain_activations and activation_matrix is not None:
-                self._update_qr_from_matrix(activation_matrix, dev)
-                del activation_matrix
-
-            self._device_sample_counts[dev] = self._device_sample_counts.get(dev, 0) + batch_token_size
-            self.nsamples += batch_token_size
+            self._stats_collector.accumulate_partial(
+                xtx=xtx,
+                device=dev,
+                batch_rows=batch_token_size,
+                activation_matrix=activation_matrix if retain_activations else None,
+            )
+            self.nsamples = self._stats_collector.nsamples
             self._hessian_dirty = True
+            if retain_activations and activation_matrix is not None:
+                del activation_matrix
 
     def preferred_staging_dtype(self, input_dtype: torch.dtype, device: torch.device) -> torch.dtype:
         device = torch.device(device)
@@ -495,33 +402,7 @@ class GPTQ:
                             torch.cuda.current_stream(device).synchronize()
 
     def compute_hessian_xtx(self, matrix: torch.Tensor) -> torch.Tensor:
-        rows = matrix.shape[0]
-        if rows == 0:
-            return torch.zeros((self.columns, self.columns), dtype=torch.float32, device=matrix.device)
-
-        stage_dtype = self.preferred_staging_dtype(matrix.dtype, matrix.device)
-        chunk_size = self.resolve_hessian_chunk_size(rows, stage_dtype)
-        self._borrow_workspace_stage_dtype = stage_dtype
-        self._borrow_workspace_last_chunk_rows = chunk_size if chunk_size is not None else rows
-
-        if chunk_size is None:
-            mat32 = matrix.to(dtype=torch.float32)
-            xtx = torch.matmul(mat32.T, mat32)
-            del mat32
-            torch_sync(device=xtx.device)
-            return xtx
-
-        xtx_accum = torch.zeros((self.columns, self.columns), dtype=torch.float32, device=matrix.device)
-
-        for start in range(0, rows, chunk_size):
-            rows_this = min(chunk_size, rows - start)
-            source = matrix[start:start + rows_this]
-            with self.borrow_materialized_chunk_fp32(source, rows_this) as materialized:
-                materialized32 = materialized
-                xtx_accum.add_(torch.matmul(materialized32.T, materialized32))
-
-        torch_sync(device=xtx_accum.device)
-        return xtx_accum
+        return self._stats_collector.compute_hessian_xtx(matrix)
 
     def process_batch(
         self,
@@ -626,8 +507,8 @@ class GPTQ:
         if hint is not None:
             return torch.device(hint)
 
-        if self._device_hessian_partials:
-            partial_device = next(iter(self._device_hessian_partials.keys()))
+        if self._stats_collector._device_hessian_partials:
+            partial_device = next(iter(self._stats_collector._device_hessian_partials.keys()))
             return torch.device(partial_device)
 
         return torch.device("cpu")
@@ -641,79 +522,15 @@ class GPTQ:
                     self.H = self.H.to(device=device)
                 return
 
-            total_samples = sum(self._device_sample_counts.values())
-
-            # Reuse the existing tensor when possible to avoid an extra allocation.
-            reuse_buffer = (
-                self.H is not None
-                and self.H.shape == (self.columns, self.columns)
-                and self.H.device == device
-            )
-
-            result_accum: torch.Tensor
-            if reuse_buffer and self.H.dtype == torch.float32:
-                result_accum = self.H
-                result_accum.zero_()
-            else:
-                torch_sync(device) # try to avoid torch.AcceleratorError: CUDA error: unspecified launch failure
-                result_accum = torch.zeros(
-                    (self.columns, self.columns),
-                    dtype=torch.float32,
-                    device=device,
-                )
-
-            if total_samples == 0:
-                self.H = result_accum
-                self.nsamples = 0
-                self._hessian_dirty = False
-                self._final_hessian_device_hint = device
-                self._device_hessian_partials.clear()
-                self._device_sample_counts.clear()
-                self._device_qr_partials.clear()
-                self._qr_R = None
-                return
-
-            for partial_device, partial in self._device_hessian_partials.items():
-                if partial.device != result_accum.device or partial.dtype != torch.float32:
-                    # TODO FIXME multi-3090 using P2P is revaling an issue where result_accum and/or partial is not ready for consolidation on the main thread
-                    # when parials are calculated on the individual
-                    try:
-                        result_accum.add_(partial.to(device=result_accum.device, dtype=torch.float32))
-                    except:
-                        log.warn(f"Quantization: Module `{self.name}` -> Retry partial.to 1/2 in 0.25s")
-                        time.sleep(0.25)
-                        try:
-                            result_accum.add_(partial.to(device=result_accum.device, dtype=torch.float32))
-                        except:
-                            log.warn(f"Quantization: Module `{self.name}` -> Retry partial.to 2/2 in 0.75s")
-                            time.sleep(0.75)
-                            result_accum.add_(partial.to(device=result_accum.device, dtype=torch.float32))
-                else:
-                    result_accum.add_(partial)
-
-            result_accum.mul_(2.0 / float(total_samples))
-
-            self.H = result_accum
-            self.nsamples = total_samples
+            self._stats_collector.finalize(target_device=device)
+            self.H = self._stats_collector.H
+            self._qr_R = self._stats_collector.qr_R
+            self.nsamples = self._stats_collector.nsamples
             self._hessian_dirty = False
-            self._final_hessian_device_hint = result_accum.device
-            self._device_hessian_partials.clear()
-            self._device_sample_counts.clear()
-
-            if self._uses_qr_factorization() and self._device_qr_partials:
-                merged_R: Optional[torch.Tensor] = None
-                for partial_R in self._device_qr_partials.values():
-                    partial_R = partial_R.to(device=result_accum.device, dtype=torch.float32)
-                    if merged_R is None:
-                        merged_R = partial_R
-                    else:
-                        merged_R = merge_qr_factors(merged_R, partial_R)
-                self._qr_R = merged_R
+            if self.H is not None:
+                self._final_hessian_device_hint = self.H.device
             else:
-                self._qr_R = None
-            self._device_qr_partials.clear()
-
-            del result_accum
+                self._final_hessian_device_hint = device
 
     def finalize_hessian(self, target_device: Optional[torch.device] = None) -> torch.Tensor:
         self.materialize_global_hessian(target_device=target_device)
@@ -898,531 +715,57 @@ class GPTQ:
 
     @torch.inference_mode()
     def hessian_inverse(self, H: torch.Tensor, qr_R: Optional[torch.Tensor] = None):
-        # Capture a writable view of the Hessian diagonal so we can restore it between attempts.
-        diag_view = H.diagonal()
-        orig_diag = diag_view.clone()
-
-        use_qr = (
-            qr_R is not None
-            and self.nsamples > 0
-            and self._uses_qr_factorization()
-            and H.device.type != "npu"
+        return compute_hessian_inverse(
+            H,
+            qcfg=self.qcfg,
+            nsamples=self.nsamples,
+            qr_R=qr_R,
+            module_name=self.name,
+            uses_qr_factorization=self._uses_qr_factorization(),
         )
-
-        # When a block is numerically singular, pure damping can stall at 1.0.
-        # Prepare a tiny diagonal floor (relative to the largest entry) that we
-        # only inject if the normal damping loop fails. Keeping the scale near 1e-6
-        # of the dominant entry keeps the bias negligible for healthy layers while
-        # still rescuing pathological Hessian blocks.
-        base_abs_max = torch.max(orig_diag.abs()).item()
-        if not math.isfinite(base_abs_max) or base_abs_max == 0.0:
-            base_abs_max = 1.0
-        floor_base = base_abs_max * 1e-6
-        max_floor_attempts = 6
-        used_damp = self.qcfg.damp_percent
-        last_error = None
-
-        attempt = 0
-        while attempt <= max_floor_attempts:
-            if attempt == 0:
-                current_diag = orig_diag
-            else:
-                floor_increment = floor_base * math.pow(10.0, attempt - 1)
-                current_diag = torch.clamp(orig_diag + floor_increment, min=floor_increment)
-                if attempt == 1:
-                    log.warn(
-                        f"Quantization: Module `{self.name}` -> Applying Hessian diagonal floor (+{floor_increment:.2e}) to recover positive definiteness.")
-                else:
-                    log.warn(
-                        f"Quantization: Module `{self.name}` -> Increasing Hessian diagonal floor to +{floor_increment:.2e}.")
-
-            diag_view.copy_(current_diag)
-            mean = torch.mean(current_diag)
-            damp = self.qcfg.damp_percent
-
-            damp_recovery_started = False
-            recovery_initial_damp = None
-            recovery_last_damp = None
-
-            while 0 < damp < 1:
-                try:
-                    if use_qr:
-                        Hinv_result = qr_hessian_inverse(
-                            qr_R,
-                            nsamples=self.nsamples,
-                            damp=damp,
-                            damp_mean=float(mean.item()),
-                        )
-                    else:
-                        diag_view.add_(damp * mean)
-                        if H.device.type == "npu":
-                            Hinv_result = npu_inverse_cholesky_factor(H)
-                        else:
-                            Hinv_result = cholesky_hessian_inverse(H)
-                        diag_view.copy_(current_diag)
-                    used_damp = damp
-                    if damp_recovery_started:
-                        log.warn(
-                            f"Quantization: Module `{self.name}` -> Damp recovery succeeded at `damp_percent={damp:.5f}` "
-                            f"(started at {recovery_initial_damp:.5f})."
-                        )
-                    return Hinv_result, used_damp
-                except torch._C._LinAlgError as e:
-                    last_error = e
-                    if not use_qr:
-                        diag_view.copy_(current_diag)
-                    if self.qcfg.damp_auto_increment != 0:
-                        if not damp_recovery_started:
-                            damp_recovery_started = True
-                            recovery_initial_damp = damp
-                            log.warn(
-                                f"Quantization: Module `{self.name}` -> Starting damp recovery at "
-                                f"`damp_percent={damp:.5f}`, increment step `{self.qcfg.damp_auto_increment:.5f}`."
-                            )
-                        damp += self.qcfg.damp_auto_increment
-                        recovery_last_damp = damp
-                    else:
-                        factorization = "QR" if use_qr else "Cholesky"
-                        log.warn(
-                            f"Quantization: Module `{self.name}` -> Hessian {factorization} failed with `damp_percent={damp:.5f}` and no auto increment configured.")
-                        break
-
-            if damp_recovery_started:
-                final_damp = recovery_last_damp if recovery_last_damp is not None else damp
-                log.warn(
-                    f"Quantization: Module `{self.name}` -> Damp recovery failed after reaching `damp_percent={final_damp:.5f}`."
-                )
-
-            attempt += 1
-
-        log.error(
-            f"Quantization: Module `{self.name}` -> Hessian remained non positive-definite after diagonal floor attempts. Last `damp_percent` tried = {damp:.5f}.")
-        if last_error is not None:
-            log.debug(f"Hessian failure detail: {last_error}")
-        return None, 1.0
 
     @torch.inference_mode()
     def quantize(
             self,
             blocksize=128,
     ):
-        # self.H = self.H.to(device=CUDA_0)
-        # log.info(f"Quantization `{self.name}` using samples: `{self.nsamples}`")
-        start = time.time()
+        from ..ptq.solvers.gptq_quantizer import GptqQuantizer
+        from ..utils.fallback import should_use_fallback
 
-        target_device = getattr(self.module, "target_device", None)
-        result_device = torch.device(self.module.weight.data.device)
-        cpu_fallback_used = False
-        from ..utils.fallback import resolve_fallback_strategy, resolve_threshold, should_use_fallback
-
-        resolved_strategy = resolve_fallback_strategy(self.fallback)
         fallback_requested = should_use_fallback(
             self.fallback,
             float(self.nsamples),
             self.expected_nsamples,
         )
-        threshold_raw, is_percent = resolve_threshold(self.fallback, self.expected_nsamples)
-        fallback_configured = threshold_raw is not None
-
-        if fallback_requested:
-            use_hessian = False
-            threshold_text = str(getattr(self.fallback, "threshold", None))
-            threshold_info = f", threshold_raw={threshold_raw}" if threshold_raw is not None and is_percent else ""
-            log.warn(
-                f"Quantization: Module `{self.name}` -> "
-                f"Using `{resolved_strategy.value}` fallback quantization (observed {self.nsamples} samples, threshold={threshold_text}{threshold_info}, max_total={self.expected_nsamples})."
-            )
-            self.H = self.create_H(target_device=target_device)
-
-            return self._fallback_quantize(resolved_strategy, blocksize)
-        else:
-            use_hessian = True
+        if not fallback_requested:
+            target_device = getattr(self.module, "target_device", None)
             self.finalize_hessian(target_device=target_device)
 
-        # Temporarily disable torch.compile due to compatibility issues with torch 2.8
-        # Will re-enable once the issue is fixed
-        # if not TORCH_GTE_28 and not self.qcfg.mock_quantization:
-        #     self.hessian_inverse = torch_compile(self.hessian_inverse)
-
-        if self.qcfg.mock_quantization:
-            # Use simplified hessian inverse (identity matrix)
-            self.hessian_inverse = self.mock_hessian_inverse
-
-        # if self.device.type not in ["mps", "cpu"]:
-        #     self.module.weight.data = self.module.weight.data.cpu()
-
-        # TODO: waiting for pytorch implementation of ops for MPS
-        if sys.platform == "darwin" and os.getenv("PYTORCH_ENABLE_MPS_FALLBACK") != "1":
-            raise RuntimeError(
-                "For MacOS you must set env `PYTORCH_ENABLE_MPS_FALLBACK=1` before running quantization.")
-
-        if self.module_copy is None:
-            # log.info("copy W to cuda_1")
-            W = self.clone_module(device=self.H.device)
-        else:
-            W = self.module_copy.to(device=self.H.device)
-            del self.module_copy
-
-        self.quantizer.find_params(W, weight=True)
-
-        # H = self.H.to(device=self.H.device)
-
-        if use_hessian:
-            dead = torch.diag(self.H) == 0
-            self.H[dead, dead] = 1
-            W[:, dead] = 0
-
-        # g_idx = []
-        scale = []
-        zero = []
-        now_idx = 1
-
-        if self.qcfg.static_groups:
-            import copy
-
-            groups = []
-            for i in range(0, self.columns, self.qcfg.group_size):
-                quantizer = copy.deepcopy(self.quantizer)
-                quantizer.find_params(W[:, i: (i + self.qcfg.group_size)], weight=True)
-
-                scale.append(quantizer.scale)
-                zero.append(quantizer.zero)
-                groups.append(quantizer)
-
-        if self.qcfg.desc_act and use_hessian:
-            perm = torch.argsort(torch.diag(self.H), descending=True)
-            try:
-                W = W[:, perm]
-                self.H = self.H[perm][:, perm]
-            except RuntimeError as exc:
-                if self.H.device.type != "cuda" or "out of memory" not in str(exc).lower():
-                    raise
-
-                self.log_cpu_fallback("Hessian permutation", self.H.device)
-                cpu_fallback_used = True
-                cpu_device = torch.device("cpu")
-                perm = perm.to(device=cpu_device)
-                W = W.to(device=cpu_device)[:, perm]
-                self.H = self.H.to(device=cpu_device)[perm][:, perm]
-                self.quantizer.find_params(W, weight=True)
-            invperm = torch.argsort(perm)
-
-        elif self.qcfg.act_group_aware and use_hessian:
-            diag_h = torch.diag(self.H)
-            local_perms, local_values = compute_local_perms(
-                diag_h, self.qcfg.group_size, return_values=True
-            )
-            global_perm = compute_global_perm(
-                diag_h,
-                self.qcfg.group_size,
-                precomputed_values=local_values,
-            )
-            del local_values
-            final_perm = compose_final_perm(local_perms, global_perm, self.qcfg.group_size)
-            final_perm = extend_perm_with_tail(final_perm, self.columns)
-            try:
-                W = W[:, final_perm]
-                self.H = self.H[final_perm][:, final_perm]
-            except RuntimeError as exc:
-                if self.H.device.type != "cuda" or "out of memory" not in str(exc).lower():
-                    raise
-
-                self.log_cpu_fallback("act-group Hessian permutation", self.H.device)
-                cpu_fallback_used = True
-                cpu_device = torch.device("cpu")
-                final_perm = final_perm.to(device=cpu_device)
-                W = W.to(device=cpu_device)[:, final_perm]
-                self.H = self.H.to(device=cpu_device)[final_perm][:, final_perm]
-                self.quantizer.find_params(W, weight=True)
-
-        if use_hessian:
-            qr_R = self._qr_R
-            column_perm = None
-            if self.qcfg.desc_act:
-                column_perm = perm
-            elif self.qcfg.act_group_aware:
-                column_perm = final_perm
-
-            if qr_R is not None and column_perm is not None:
-                qr_R = apply_column_perm_to_qr(qr_R, column_perm)
-            if qr_R is not None:
-                qr_R = qr_R.to(device=self.H.device)
-
-            try:
-                Hinv, damp = self.hessian_inverse(self.H, qr_R=qr_R)
-            except RuntimeError as exc:
-                if self.H.device.type != "cuda" or "out of memory" not in str(exc).lower():
-                    raise
-
-                # Full-attention blocks on very large models can exceed GPU memory during the
-                # dense Hessian inverse; finish that module on CPU instead of aborting the run.
-                self.log_cpu_fallback("Hessian inverse", self.H.device)
-                cpu_fallback_used = True
-                cpu_device = torch.device("cpu")
-                self.H = self.H.to(device=cpu_device)
-                W = W.to(device=cpu_device)
-                self.quantizer.find_params(W, weight=True)
-                if qr_R is not None:
-                    qr_R = qr_R.to(device=cpu_device)
-                Hinv, damp = self.hessian_inverse(self.H, qr_R=qr_R)
-        else:
-            Hinv, damp = None, 0.0
-
-        Losses = torch.zeros_like(W)
-        Q = torch.zeros_like(W)
-
-        # Use simplified loop when mock_quantization is active
-        if self.qcfg.mock_quantization:
-            for i1 in range(0, self.columns, blocksize):
-                i2 = min(i1 + blocksize, self.columns)
-                count = i2 - i1
-
-                W1 = W[:, i1:i2]
-                Q1 = torch.zeros_like(W1)
-
-                # Handle group quantization parameters efficiently (similar to original)
-                if self.qcfg.group_size != -1:
-                    if not self.qcfg.static_groups:
-                        # Find parameters for entire groups at once (optimized)
-                        group_start_cols = list(range(i1, i2, self.qcfg.group_size))
-                        for group_start in group_start_cols:
-                            group_end = min(group_start + self.qcfg.group_size, self.columns)
-                            if group_start < group_end:
-                                self.quantizer.find_params(W[:, group_start:group_end], weight=True)
-                                scale.append(self.quantizer.scale)
-                                zero.append(self.quantizer.zero)
-                                now_idx += 1
-                    else:
-                        # Static groups - use pre-computed groups
-                        for i in range(count):
-                            idx = i1 + i
-                            if self.qcfg.desc_act:
-                                idx = perm[idx]
-                            self.quantizer = groups[idx // self.qcfg.group_size]
-
-                    # Vectorized quantization for the entire block (major optimization)
-                    if len(scale) > 0 and len(zero) > 0:
-                        # Use latest scale and zero for the entire block
-                        latest_scale = scale[-1]
-                        latest_zero = zero[-1]
-
-                        # Vectorized quantization using broadcasting
-                        # Reshape scales and zeros to match block dimensions
-                        if latest_scale.dim() == 1:
-                            latest_scale = latest_scale.view(-1, 1)
-                        if latest_zero.dim() == 1:
-                            latest_zero = latest_zero.view(-1, 1)
-
-                        # Apply quantization formula using the cloned weights W1
-                        maxq_val = 2 ** self.qcfg.bits - 1
-                        if self.qcfg.sym:
-                            # Symmetric quantization: Q = scale * clamp(round(x/scale), -maxq/2, maxq/2)
-                            Q1 = latest_scale * torch.clamp(
-                                torch.round(W1 / latest_scale),
-                                -(maxq_val // 2),
-                                maxq_val // 2
-                            )
-                        else:
-                            # Asymmetric quantization: Q = scale * (clamp(round(x/scale) + zero, 0, maxq) - zero)
-                            quantized = torch.clamp(
-                                torch.round(W1 / latest_scale) + latest_zero,
-                                0,
-                                maxq_val
-                            )
-                            Q1 = latest_scale * (quantized - latest_zero)
-                    else:
-                        # Fallback to individual quantization if no scale/zero available
-                        for i in range(count):
-                            w = W1[:, i]
-                            q = self.quantizer.quantize(w.unsqueeze(1)).flatten()
-                            Q1[:, i] = q
-                else:
-                    # No grouping - vectorized quantization for entire block
-                    maxq_val = 2 ** self.qcfg.bits - 1
-                    if hasattr(self.quantizer, 'scale') and hasattr(self.quantizer, 'zero'):
-                        latest_scale = self.quantizer.scale
-                        latest_zero = self.quantizer.zero
-
-                        if latest_scale.dim() == 1:
-                            latest_scale = latest_scale.view(-1, 1)
-                        if latest_zero.dim() == 1:
-                            latest_zero = latest_zero.view(-1, 1)
-
-                        if self.qcfg.sym:
-                            Q1 = latest_scale * torch.clamp(
-                                torch.round(W1 / latest_scale),
-                                -(maxq_val // 2),
-                                maxq_val // 2
-                            )
-                        else:
-                            quantized = torch.clamp(
-                                torch.round(W1 / latest_scale) + latest_zero,
-                                0,
-                                maxq_val
-                            )
-                            Q1 = latest_scale * (quantized - latest_zero)
-                    else:
-                        # Fallback to individual quantization
-                        for i in range(count):
-                            w = W1[:, i]
-                            q = self.quantizer.quantize(w.unsqueeze(1)).flatten()
-                            Q1[:, i] = q
-
-                Q[:, i1:i2] = Q1
-        else:
-            # Original heavy loop for normal quantization
-            effective_block = blocksize
-            if Hinv is None and self.qcfg.group_size and self.qcfg.group_size > 0:
-                # Align RTN fallback work chunks to group boundaries to avoid
-                # redundant quantizer reconfiguration across partial groups.
-                effective_block = self.qcfg.group_size
-
-            for i1 in range(0, self.columns, effective_block):
-                i2 = min(i1 + effective_block, self.columns)
-                count = i2 - i1
-
-                W1 = W[:, i1:i2].clone()
-                Q1 = torch.zeros_like(W1)
-                Err1 = torch.zeros_like(W1) if Hinv is not None else None
-                Losses1 = torch.zeros_like(W1) if Hinv is not None else None
-
-                if Hinv is not None:
-                    Hinv1 = Hinv[i1:i2, i1:i2]
-
-                for i in range(count):
-                    w = W1[:, i]
-                    if Hinv is not None:
-                        d = Hinv1[i, i]
-
-                    if self.qcfg.group_size != -1:
-                        if not self.qcfg.static_groups:
-                            if (i1 + i) % self.qcfg.group_size == 0:
-                                self.quantizer.find_params(W[:, (i1 + i) : (i1 + i + self.qcfg.group_size)], weight=True)
-
-                            if ((i1 + i) // self.qcfg.group_size) - now_idx == -1:
-                                scale.append(self.quantizer.scale)
-                                zero.append(self.quantizer.zero)
-                                now_idx += 1
-                        else:
-                            idx = i1 + i
-                            if self.qcfg.desc_act:
-                                idx = perm[idx]
-
-                            self.quantizer = groups[idx // self.qcfg.group_size]
-
-                    q = self.quantizer.quantize(w.unsqueeze(1)).flatten()
-                    Q1[:, i] = q
-                    if Hinv is not None:
-                        Losses1[:, i] = (w - q) ** 2 / d**2
-                        err1 = (w - q) / d
-                        W1[:, i:] -= err1.unsqueeze(1).matmul(Hinv1[i, i:].unsqueeze(0))
-                        Err1[:, i] = err1
-
-                Q[:, i1:i2] = Q1
-                if Hinv is not None:
-                    Losses[:, i1:i2] = Losses1 / 2
-                    W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
-
-                del W1, Q1, Err1, Losses1
-                if Hinv is not None:
-                    del Hinv1
-
-        # TODO: why is there a torch_sync here? There are no streaming ops here?
-        # torch_sync(device=self.module.target_device)
-
-        if Hinv is not None:
-            del Hinv
-            self._qr_R = None
-            if self.nsamples != 0:
-                avg_loss = torch.sum(Losses).item() / self.nsamples
-
-                if math.isnan(avg_loss):
-                    print("Losses sum item:", torch.sum(Losses).item())
-                    if fallback_configured:
-                        log.info(f"Quantization: Failed due to `NaN` loss for `{self.name}`, use mock quantization retry for `{self.name}`")
-                        self.qcfg.mock_quantization = True
-                        return self.quantize(blocksize=blocksize)
-                    else:
-                        raise ValueError(f"Quantization: Failed due to `NaN` loss for `{self.name}`, please try increasing calibration data samples or enable fallback=True")
-            else:
-                if fallback_configured:
-                    log.warn(f"Quantization: Module `{self.name}` -> using fail safe mode. Please check if calibration data is sufficient.")
-                else:
-                    log.warn(f"Quantization: `{self.name}` is not activated due to model inference logic (MoE)")
-                avg_loss = f"{resolved_strategy.value} fallback" if fallback_configured else 999999999
-        else:
-            avg_loss = f"{resolved_strategy.value} fallback" if fallback_configured else 999999999
-
-        del Losses
-        del self.H
-        del W
-
-        group_size = self.qcfg.group_size if self.qcfg.group_size != -1 else self.columns
-
-        if self.qcfg.static_groups and self.qcfg.desc_act:
-            g_idx = [perm[i] // group_size for i in range(self.columns)]
-        else:
-            g_idx = [i // group_size for i in range(self.columns)]
-
-        g_idx = torch.tensor(g_idx, dtype=torch.int32, device=Q.device)
-
-        if self.qcfg.desc_act and use_hessian:
-            invperm = invperm.to(device=Q.device)
-            Q = Q[:, invperm]
-            g_idx = g_idx[invperm]
-            del perm, invperm
-
-        elif self.qcfg.act_group_aware and use_hessian:
-            inv_final = invert_perm(final_perm).to(device=Q.device)
-            Q = Q[:, inv_final]
-            inv_global_perm = invert_perm(global_perm)
-            inv_global_perm_list = inv_global_perm.tolist()
-            reordered_group_count = len(inv_global_perm_list)
-            temp_scale = [scale[i] for i in inv_global_perm_list]
-            temp_scale.extend(scale[reordered_group_count:])
-            scale = temp_scale
-            temp_zero = [zero[i] for i in inv_global_perm_list]
-            temp_zero.extend(zero[reordered_group_count:])
-            zero = temp_zero
-            del final_perm, inv_final, global_perm, inv_global_perm, inv_global_perm_list, local_perms
-
-        if self._tp_pad_cols:
-            valid_cols = self._original_columns
-            Q = Q[:, :valid_cols]
-            g_idx = g_idx[:valid_cols]
-
-        if isinstance(self.module, transformers.Conv1D):
-            Q = Q.t()
-
-        if Q.shape != self.module.weight.shape:
-            Q = Q.reshape(self.module.weight.shape).to(self.module.weight.dtype)
-        else:
-            Q = Q.to(self.module.weight.dtype)
-
-        if scale == []:
-            scale.append(self.quantizer.scale)
-            zero.append(self.quantizer.zero)
-
-        scale = torch.cat(scale, dim=1)
-        zero = torch.cat(zero, dim=1)
-
-        if self._tp_pad_cols:
-            valid_cols = self._original_columns
-            scale = self.truncate_last_dim(scale, valid_cols)
-            zero = self.truncate_last_dim(zero, valid_cols)
-
-        if cpu_fallback_used and Q.device != result_device:
-            log.info(
-                "Quantization: Module `%s` -> CPU fallback complete; moving final quantized weights back to %s.",
-                self.name,
-                result_device,
-            )
-
-        Q = Q.to(device=result_device, non_blocking=False)
-
-        duration = time.time() - start
-
-        return Q, scale, zero, g_idx, duration, avg_loss, damp, self.nsamples
+        wrapper = self._named_module if self._named_module is not None else self.module
+        quantizer = GptqQuantizer(
+            wrapper,
+            qcfg=self.qcfg,
+            H=self.H if self.H is not None else self.create_H(getattr(self.module, "target_device", None)),
+            nsamples=self.nsamples,
+            qr_R=self._qr_R,
+            expected_nsamples=self.expected_nsamples,
+            fallback=self.fallback,
+            module_copy=self.module_copy,
+            name=self.name,
+        )
+        result = quantizer.quantize(blocksize=blocksize)
+        self.module_copy = None
+        self.H = None
+        return (
+            result.pack_weight,
+            result.q_scales,
+            result.q_zeros,
+            result.q_g_idx,
+            result.duration,
+            result.avg_loss,
+            result.damp,
+            result.nsamples,
+        )
 
     def borrow_materialized_chunk_stats(self, reset: bool = False) -> Dict[str, int]:
         stats = dict(self._borrow_workspace_stats)

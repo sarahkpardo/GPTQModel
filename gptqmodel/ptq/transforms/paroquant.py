@@ -103,6 +103,22 @@ class ParoQuantTransform:
             return weight
         return pseudo.to(device=device, dtype=weight.dtype)
 
+    def transform_hessian(self, H: torch.Tensor, state: TransformState) -> torch.Tensor:
+        del state
+        return H
+
+    def get_inference_data(self, state: TransformState) -> "InferenceTransformData":
+        from ..inference_data import InferenceTransformData
+
+        pairs = state.payload.get("pairs")
+        theta = state.payload.get("theta")
+        return InferenceTransformData(
+            transform_type="givens",
+            T_X_pairs=pairs if isinstance(pairs, torch.Tensor) else None,
+            T_X_angles=theta if isinstance(theta, torch.Tensor) else None,
+            precision=torch.float16,
+        )
+
     def activation_pre_hook(self, state: TransformState) -> Callable[..., None]:
         del state
 

@@ -9,10 +9,12 @@ import torch.nn as nn
 from ...looper.named_module import NamedModule
 from ..config import ExportTargetConfig
 from ..context import TransformState, WeightQuantState
+from ..inference_data import InferenceTransformData
+from ..inference_hooks import register_activation_pre_hook
 
 
 class GptqExport:
-    """No-op export backend; GPTQProcessor.submodule_finalize performs packing."""
+    """Attach inference transform metadata during GPTQ module packing."""
 
     def __init__(self, cfg: ExportTargetConfig) -> None:
         self.cfg = cfg
@@ -24,6 +26,26 @@ class GptqExport:
         submodule: nn.Module,
         transform: TransformState | None,
         weight_quant: WeightQuantState,
+        inference: InferenceTransformData | None = None,
         model: nn.Module,
     ) -> None:
-        del module_name, submodule, transform, weight_quant, model, self.cfg
+        del module_name, model, self.cfg
+        target = submodule.module if isinstance(submodule, NamedModule) else submodule
+        inference_data = inference
+        if inference_data is None:
+            extra = weight_quant.extra.get("inference_transform")
+            if isinstance(extra, InferenceTransformData):
+                inference_data = extra
+            elif isinstance(extra, dict):
+                inference_data = InferenceTransformData.from_dict(extra)
+            elif transform is not None and transform.inference is not None:
+                inference_data = transform.inference
+
+        if inference_data is None or inference_data.is_identity():
+            return
+
+        register_activation_pre_hook(target, transform, inference=inference_data)
+        if isinstance(submodule, NamedModule):
+            submodule.state["ptq_inference_transform"] = inference_data.to_dict()
+        else:
+            setattr(target, "_ptq_inference_transform", inference_data.to_dict())

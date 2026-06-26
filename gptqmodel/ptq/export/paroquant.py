@@ -16,6 +16,7 @@ from ...utils.model import create_quant_module, find_modules, move_to, pack_modu
 from ...utils.module_locks import parent_module_lock
 from ..config import ExportTargetConfig
 from ..context import TransformState, WeightQuantState
+from ..inference_data import InferenceTransformData
 
 _PACK_LOCK = threading.Lock()
 
@@ -31,9 +32,10 @@ class ParoQuantExport:
         submodule: nn.Module,
         transform: TransformState | None,
         weight_quant: WeightQuantState,
+        inference: InferenceTransformData | None = None,
         model: nn.Module,
     ) -> None:
-        del weight_quant
+        del inference, weight_quant
         if transform is None or transform.method != "paroquant":
             raise ValueError("ParoQuantExport requires a paroquant TransformState.")
         if not isinstance(submodule, NamedModule):

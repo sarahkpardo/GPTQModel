@@ -10,7 +10,7 @@ from typing import Any, Optional
 import torch
 import torch.nn as nn
 
-from ...quantization.gptq import GPTQ
+from .gptq_quantizer import GptqQuantizer
 
 
 @dataclass
@@ -42,30 +42,26 @@ class GptqSolver:
         expected_nsamples: Optional[float] = None,
         blocksize: int = 128,
     ) -> GptqSolveResult:
-        gptq = GPTQ(module, qcfg=qcfg)
-        gptq.fallback = None
-        gptq.expected_nsamples = expected_nsamples
-        gptq.quantizer.configure(perchannel=True)
-        gptq.module.weight.data = gptq.module.weight.data.to(H.device)
-
-        gptq.H = H.to(device=H.device, dtype=torch.float32)
-        gptq.nsamples = int(nsamples)
-        gptq._hessian_dirty = False
-        if qr_R is not None:
-            gptq._qr_R = qr_R.to(device=H.device, dtype=torch.float32)
-
-        wq, q_scales, q_zeros, q_g_idx, duration, avg_loss, damp, out_nsamples = gptq.quantize(
-            blocksize=blocksize
+        quantizer = GptqQuantizer(
+            module,
+            qcfg=qcfg,
+            H=H,
+            nsamples=nsamples,
+            qr_R=qr_R,
+            expected_nsamples=expected_nsamples,
+            fallback=None,
         )
+        quantizer.module.weight.data = quantizer.module.weight.data.to(H.device)
+        result = quantizer.quantize(blocksize=blocksize)
 
         return GptqSolveResult(
-            pack_weight=wq,
-            q_scales=q_scales,
-            q_zeros=q_zeros,
-            q_g_idx=q_g_idx,
-            avg_loss=avg_loss,
-            damp=damp,
-            nsamples=out_nsamples,
-            duration=duration,
-            backend=gptq,
+            pack_weight=result.pack_weight,
+            q_scales=result.q_scales,
+            q_zeros=result.q_zeros,
+            q_g_idx=result.q_g_idx,
+            avg_loss=result.avg_loss,
+            damp=result.damp,
+            nsamples=result.nsamples,
+            duration=result.duration,
+            backend=quantizer,
         )

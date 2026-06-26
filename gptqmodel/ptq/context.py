@@ -5,9 +5,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
+
+from .inference_data import InferenceTransformData
 
 
 @dataclass
@@ -17,6 +19,15 @@ class TransformState:
     method: str
     bake_weights: bool = True
     payload: Dict[str, Any] = field(default_factory=dict)
+    inference: Optional[InferenceTransformData] = None
+
+
+@dataclass
+class TransformResult:
+    """Offline transform output including kernel-facing inference metadata."""
+
+    state: TransformState
+    H_transformed: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -46,9 +57,23 @@ class ModuleCalibContext:
     expected_calibration_tokens: Optional[int] = None
     H: Optional[torch.Tensor] = None
     qr_R: Optional[torch.Tensor] = None
+    H_inv: Optional[torch.Tensor] = None
+    damp: Optional[float] = None
     row_buffer: Optional[torch.Tensor] = None
+    block_M_W: List[torch.Tensor] = field(default_factory=list)
+    block_M_X: List[torch.Tensor] = field(default_factory=list)
     transform: Optional[TransformState] = None
     weight_quant: Optional[WeightQuantState] = None
+
+    def with_hessian_inverse(
+        self,
+        H_inv: torch.Tensor,
+        *,
+        damp: float,
+    ) -> "ModuleCalibContext":
+        self.H_inv = H_inv
+        self.damp = damp
+        return self
 
     def gram_from_qr(self) -> Optional[torch.Tensor]:
         """Materialize H = R^T R when only the QR factor is stored."""
@@ -56,3 +81,7 @@ class ModuleCalibContext:
             return None
         R = self.qr_R.to(dtype=torch.float32)
         return R.transpose(-1, -2) @ R
+
+
+# Documentation alias for the Chen et al. statistics bundle.
+LayerStatistics = ModuleCalibContext
