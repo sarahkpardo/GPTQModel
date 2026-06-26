@@ -288,7 +288,6 @@ def build_dense_activation_hook(
     t_x_matrices = inference.T_X_matrices
     block_size = int(inference.block_size)
     resolved_pad = _resolve_inference_pad(inference, pad=pad)
-    inference_dtype = inference.precision
 
     def _hook(_module, args, kwargs):
         if not args and "input" not in kwargs:
@@ -297,13 +296,15 @@ def build_dense_activation_hook(
         if not isinstance(x, torch.Tensor):
             return None
         original_columns = x.shape[-1]
+        # Apply T_X in float32 using activation dtype for numerical stability; fp16
+        # storage of Q.T can break the bilinear constraint enough to hurt PPL.
         transformed = apply_block_transform_to_activation(
-            x,
-            t_x_matrices.to(device=x.device, dtype=inference_dtype),
+            x.float(),
+            t_x_matrices.to(device=x.device, dtype=torch.float32),
             block_size=block_size,
             pad=resolved_pad,
             original_columns=original_columns,
-        )
+        ).to(dtype=x.dtype)
         if args:
             new_args = (transformed, *args[1:])
             return new_args, kwargs

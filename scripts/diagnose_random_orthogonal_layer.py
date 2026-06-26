@@ -46,7 +46,10 @@ import torch.nn as nn  # noqa: E402
 from gptqmodel import BACKEND, GPTQModel, QuantizeConfig  # noqa: E402
 from gptqmodel.ptq.stats import StatisticsCollector  # noqa: E402
 from gptqmodel.quantization.gptq import get_number_of_rows_and_cols  # noqa: E402
-from gptqmodel.utils.moe_benchmark import configure_moe_quantize_config, moe_quantize_load_kwargs  # noqa: E402
+from gptqmodel.utils.moe_benchmark import (  # noqa: E402
+    benchmark_quantize_load_kwargs,
+    configure_moe_quantize_config,
+)
 from gptqmodel.utils.random_orthogonal_diag import (  # noqa: E402
     LayerDiagResult,
     audit_ptq_hooks,
@@ -75,9 +78,20 @@ def _resolve_module(model: GPTQModel, module_name: str) -> nn.Module:
     return target
 
 
+def _ensure_eager_weights(model: GPTQModel) -> None:
+    """Materialize any lazy/meta shells so manual forwards can run."""
+    try:
+        from defuser.modeling.replace_modules import materialize_model
+
+        materialize_model(model.model)
+    except ImportError:
+        pass
+
+
 def _run_calibration_forwards(model: GPTQModel, calibration, *, batch_size: int) -> None:
     device = next(model.model.parameters()).device
     model.model.eval()
+    _ensure_eager_weights(model)
     with torch.inference_mode():
         for index in range(0, len(calibration), batch_size):
             batch_samples = calibration[index : index + batch_size]
@@ -87,6 +101,8 @@ def _run_calibration_forwards(model: GPTQModel, calibration, *, batch_size: int)
                 else:
                     encoded = model.tokenizer(sample, return_tensors="pt")
                     batch = {key: value.to(device) for key, value in encoded.items()}
+                if "attention_mask" not in batch and "input_ids" in batch:
+                    batch["attention_mask"] = torch.ones_like(batch["input_ids"])
                 model.model(**batch)
 
 
@@ -152,7 +168,7 @@ def _build_qcfg(
         weight_quantize={"method": "gptq"},
         weight_export={"format": "gptq"},
     )
-    kwargs.update(moe_quantize_load_kwargs(model_id, trust_remote_code=trust_remote_code))
+    kwargs.update(benchmark_quantize_load_kwargs(model_id, trust_remote_code=trust_remote_code))
     return QuantizeConfig(**kwargs)
 
 
@@ -191,6 +207,7 @@ def run_single_module_diag(
             trust_remote_code=trust_remote_code,
         ),
         "backend": BACKEND.TORCH,
+        "device": device,
     }
     if trust_remote_code:
         load_kwargs["trust_remote_code"] = True
@@ -272,7 +289,7 @@ def run_full_model_audit(
     probe_modules: Sequence[str],
     calib_concat_size: int,
 ) -> dict[str, object]:
-    moe_kwargs = moe_quantize_load_kwargs(model_id, trust_remote_code=trust_remote_code)
+    moe_kwargs = benchmark_quantize_load_kwargs(model_id, trust_remote_code=trust_remote_code)
     kwargs = dict(
         bits=bits,
         group_size=group_size,
@@ -297,11 +314,11 @@ def run_full_model_audit(
             }
         ]
 
-    load_kwargs = {"quantize_config": QuantizeConfig(**kwargs), "backend": BACKEND.TORCH}
+    load_kwargs = {"quantize_config": QuantizeConfig(**kwargs), "backend": BACKEND.TORCH, "device": device}
     if trust_remote_code:
         load_kwargs["trust_remote_code"] = True
 
-    fp16_load: dict[str, object] = {"backend": BACKEND.TORCH}
+    fp16_load: dict[str, object] = {"backend": BACKEND.TORCH, "device": device}
     if trust_remote_code:
         fp16_load["trust_remote_code"] = True
     fp16_reference = GPTQModel.load(model_id, **fp16_load)
@@ -385,6 +402,8 @@ def main() -> int:
     args = parser.parse_args()
 
     load_kwargs = {"backend": BACKEND.TORCH}
+    if args.device:
+        load_kwargs["device"] = args.device
     if args.trust_remote_code:
         load_kwargs["trust_remote_code"] = True
     tokenizer_model = GPTQModel.load(args.model_id, **load_kwargs)
@@ -392,13 +411,13 @@ def main() -> int:
         tokenizer_model.tokenizer,
         max_samples=args.calib_samples,
         min_length=10,
-        concat_size=0,
+        concat_size=args.calib_concat_size if args.calib_concat_size > 0 else 0,
     )
     del tokenizer_model
 
     module_name = args.module_name
     if module_name is None and args.mode in {"single_module", "both"}:
-        module_name = "model.layers.0.self_attn.q_proj"
+        module_name = "model.model.layers.0.self_attn.q_proj"
 
     probe_modules = [part.strip() for part in args.probe_modules.split(",") if part.strip()]
     if not probe_modules and args.mode in {"full_audit", "both"}:

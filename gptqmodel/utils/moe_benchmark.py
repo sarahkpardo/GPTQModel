@@ -32,6 +32,18 @@ def moe_quantize_load_kwargs(model_id: str, *, trust_remote_code: bool = False) 
     return {"offload_to_disk": False}
 
 
+def benchmark_quantize_load_kwargs(model_id: str, *, trust_remote_code: bool = False) -> dict[str, object]:
+    """Return ``QuantizeConfig`` overrides for benchmark/diagnostic scripts.
+
+    Eager CPU/GPU weights are required for manual calibration forwards (diagnose
+    scripts) and reliable module discovery. MoE models also need routing overrides
+    via :func:`configure_moe_quantize_config`.
+    """
+    kwargs: dict[str, object] = {"offload_to_disk": False}
+    kwargs.update(moe_quantize_load_kwargs(model_id, trust_remote_code=trust_remote_code))
+    return kwargs
+
+
 def apply_moe_routing_override(qcfg: QuantizeConfig, *, enabled: bool = True) -> QuantizeConfig:
     """Attach ExpertsRoutingOverride when benchmarking MoE models."""
     if not enabled or qcfg.moe is not None:

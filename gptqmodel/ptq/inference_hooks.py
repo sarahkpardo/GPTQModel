@@ -92,11 +92,12 @@ def _inference_from_buffers(module: nn.Module) -> InferenceTransformData | None:
     pad = int(getattr(module, "ptq_t_x_pad", torch.tensor(0)).item())
     method = _decode_method_name(getattr(module, "ptq_transform_method_bytes", None))
     transform_type = "dense" if method in {"random_orthogonal", "rand_ortho", "quip_incoherence"} else method
+    precision = t_x.dtype if t_x.is_floating_point() else torch.float16
     return InferenceTransformData(
         transform_type=transform_type,
         T_X_matrices=t_x,
         block_size=block_size,
-        precision=torch.float16,
+        precision=precision,
         extra={"pad": pad, "method": method},
     )
 

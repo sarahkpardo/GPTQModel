@@ -18,7 +18,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from gptqmodel import BACKEND, GPTQModel, QuantizeConfig  # noqa: E402
-from gptqmodel.utils.moe_benchmark import configure_moe_quantize_config, moe_quantize_load_kwargs  # noqa: E402
+from gptqmodel.utils.moe_benchmark import benchmark_quantize_load_kwargs, configure_moe_quantize_config  # noqa: E402
 from gptqmodel.utils.wikitext_benchmark import (  # noqa: E402
     compute_wikitext_perplexity,
     load_wikitext_calibration,
@@ -59,7 +59,7 @@ def _build_quantize_config(*, weight_prepare: str, group_size: int = 128, model_
         weight_quantize={"method": "gptq"},
         weight_export={"format": "gptq"},
     )
-    kwargs.update(moe_quantize_load_kwargs(model_id))
+    kwargs.update(benchmark_quantize_load_kwargs(model_id))
     if weight_prepare == "random_orthogonal":
         kwargs["weight_prepare"] = [
             {

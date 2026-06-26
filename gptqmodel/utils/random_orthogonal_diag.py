@@ -236,16 +236,16 @@ def post_quant_output_mse(
         t_w_blocks = payload["T_W_blocks"]
         t_x = payload.get("T_X_matrices")
         if t_x is None:
-            t_x = _stack_t_x(t_w_blocks, dtype=x.dtype, device=x.device)
+            t_x = _stack_t_x(t_w_blocks, dtype=torch.float32, device=x.device)
         else:
-            t_x = t_x.to(device=x.device, dtype=x.dtype)
+            t_x = t_x.to(device=x.device, dtype=torch.float32)
         x_tx = apply_block_transform_to_activation(
-            x,
+            x.float(),
             t_x,
             block_size=block_size,
             pad=pad,
             original_columns=x.shape[-1],
-        )
+        ).to(dtype=x.dtype)
         approx = _linear_forward(x_tx, weight_q, layout)
     return (target - approx).pow(2).mean().item()
 

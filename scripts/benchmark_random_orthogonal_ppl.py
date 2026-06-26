@@ -42,9 +42,9 @@ import torch  # noqa: E402
 
 from gptqmodel import BACKEND, GPTQModel, QuantizeConfig  # noqa: E402
 from gptqmodel.utils.moe_benchmark import (  # noqa: E402
+    benchmark_quantize_load_kwargs,
     configure_moe_quantize_config,
     is_moe_gptq_model,
-    moe_quantize_load_kwargs,
 )
 from gptqmodel.utils.random_orthogonal_diag import (  # noqa: E402
     audit_ptq_hooks,
@@ -132,7 +132,7 @@ def _run_method(
     inference_precision: str,
     legacy_random_orthogonal_damp: bool,
 ) -> dict[str, object]:
-    moe_load_kwargs = moe_quantize_load_kwargs(model_id, trust_remote_code=trust_remote_code)
+    moe_load_kwargs = benchmark_quantize_load_kwargs(model_id, trust_remote_code=trust_remote_code)
     qcfg = _build_quantize_config(
         weight_prepare=weight_prepare,
         bits=bits,
