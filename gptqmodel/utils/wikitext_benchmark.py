@@ -191,16 +191,6 @@ def compute_wikitext_perplexity(
 
 def mean_quant_loss(quantize_result: dict[str, list[dict[str, str]]]) -> float | None:
     """Average numeric module ``loss`` values from ``GPTQModel.quantize()`` log output."""
-    losses: list[float] = []
-    for entries in quantize_result.values():
-        for entry in entries:
-            raw = entry.get("loss", "")
-            if raw in {"", "unknown"}:
-                continue
-            try:
-                losses.append(float(raw))
-            except (TypeError, ValueError):
-                continue
-    if not losses:
-        return None
-    return sum(losses) / len(losses)
+    from .random_orthogonal_diag import summarize_quant_log
+
+    return summarize_quant_log(quantize_result).mean_loss

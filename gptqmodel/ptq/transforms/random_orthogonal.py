@@ -79,6 +79,7 @@ class RandomOrthogonalTransform:
         padded, pad, num_blocks = pad_columns(input_columns, block_size)
         seed = module_seed_from_options(module_name=ctx.module_name, options=options)
         inference_dtype = _resolve_inference_dtype(options)
+        inference_precision = str(options.get("inference_precision", "float16")).strip().lower()
 
         t_w_blocks, t_x_matrices = generate_random_orthogonal_blocks(
             block_size,
@@ -98,7 +99,7 @@ class RandomOrthogonalTransform:
             "weight_layout": weight_layout,
             "T_W_blocks": t_w_blocks,
             "T_X_matrices": t_x_matrices,
-            "inference_precision": "float16",
+            "inference_precision": inference_precision,
         }
         return TransformState(
             method="random_orthogonal",

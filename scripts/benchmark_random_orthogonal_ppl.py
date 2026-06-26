@@ -46,6 +46,10 @@ from gptqmodel.utils.moe_benchmark import (  # noqa: E402
     is_moe_gptq_model,
     moe_quantize_load_kwargs,
 )
+from gptqmodel.utils.random_orthogonal_diag import (  # noqa: E402
+    audit_ptq_hooks,
+    summarize_quant_log,
+)
 from gptqmodel.utils.wikitext_benchmark import (  # noqa: E402
     compute_wikitext_perplexity,
     load_wikitext_calibration,
@@ -61,6 +65,9 @@ def _build_quantize_config(
     bits: int,
     group_size: int,
     device: str,
+    damp_percent: float,
+    inference_precision: str,
+    legacy_random_orthogonal_damp: bool,
     extra_kwargs: dict[str, object] | None = None,
 ) -> QuantizeConfig:
     kwargs = dict(
@@ -68,7 +75,7 @@ def _build_quantize_config(
         group_size=group_size,
         sym=True,
         desc_act=False,
-        damp_percent=0.01,
+        damp_percent=damp_percent,
         damp_auto_increment=0.01,
         device=device,
         hessian={"factorization": "cholesky", "row_buffer_max_rows": 512},
@@ -84,9 +91,11 @@ def _build_quantize_config(
                 "method": "random_orthogonal",
                 "group_size": group_size,
                 "opt_seed": 42,
+                "inference_precision": inference_precision,
             }
         ]
-        kwargs["damp_percent"] = 0.05
+        if legacy_random_orthogonal_damp:
+            kwargs["damp_percent"] = 0.05
     return QuantizeConfig(**kwargs)
 
 
@@ -119,6 +128,9 @@ def _run_method(
     eval_n_tokens: int,
     work_dir: Path,
     trust_remote_code: bool,
+    damp_percent: float,
+    inference_precision: str,
+    legacy_random_orthogonal_damp: bool,
 ) -> dict[str, object]:
     moe_load_kwargs = moe_quantize_load_kwargs(model_id, trust_remote_code=trust_remote_code)
     qcfg = _build_quantize_config(
@@ -126,6 +138,9 @@ def _run_method(
         bits=bits,
         group_size=group_size,
         device=device,
+        damp_percent=damp_percent,
+        inference_precision=inference_precision,
+        legacy_random_orthogonal_damp=legacy_random_orthogonal_damp,
         extra_kwargs=moe_load_kwargs,
     )
     backend = _resolve_backend(device)
@@ -153,7 +168,8 @@ def _run_method(
         quantize_kwargs["backend"] = quantize_backend
 
     quant_result = model.quantize(calibration, **quantize_kwargs)
-    avg_loss = mean_quant_loss(quant_result)
+    log_summary = summarize_quant_log(quant_result, base_damp=damp_percent)
+    avg_loss = log_summary.mean_loss
 
     output_dir = work_dir / f"quantized-{weight_prepare}"
     if output_dir.exists():
@@ -168,6 +184,7 @@ def _run_method(
         reload_kwargs["backend"] = backend
     reloaded = GPTQModel.load(str(output_dir), **reload_kwargs)
     hook_count = _count_ptq_hooks(reloaded)
+    hook_audit = audit_ptq_hooks(reloaded.model)
 
     if weight_prepare == "random_orthogonal" and hook_count == 0:
         raise RuntimeError(
@@ -188,23 +205,41 @@ def _run_method(
         "weight_prepare": weight_prepare,
         "perplexity": ppl,
         "mean_quant_loss": avg_loss,
+        "max_damp": log_summary.max_damp,
+        "modules_with_elevated_damp": log_summary.modules_with_elevated_damp,
+        "quant_module_count": log_summary.module_count,
         "t_x_hooks": hook_count,
+        "t_x_buffers": hook_audit.modules_with_t_x_buffers,
+        "padded_modules": hook_audit.modules_with_pad[:10],
         "checkpoint": str(output_dir),
     }
 
 
 def _print_table(rows: list[dict[str, object]]) -> None:
-    headers = ("Method", "PPL", "Quant loss (mean)", "T_X hooks")
-    print(f"\n{'Method':<28} | {'PPL':>10} | {'Quant loss':>14} | {'T_X hooks':>9}")
-    print("-" * 72)
+    print(
+        f"\n{'Method':<28} | {'PPL':>10} | {'Quant loss':>14} | "
+        f"{'Max damp':>9} | {'Elev damp':>9} | {'T_X hooks':>9}"
+    )
+    print("-" * 92)
     for row in rows:
         ppl = row.get("perplexity")
         loss = row.get("mean_quant_loss")
         hooks = row.get("t_x_hooks", "—")
+        max_damp = row.get("max_damp")
+        elevated = row.get("modules_with_elevated_damp", "—")
         ppl_str = f"{ppl:.4f}" if isinstance(ppl, float) and math.isfinite(ppl) else "nan"
         loss_str = f"{loss:.6f}" if isinstance(loss, float) else "—"
         hooks_str = str(hooks) if hooks != "—" else "—"
-        print(f"{row['method']:<28} | {ppl_str:>10} | {loss_str:>14} | {hooks_str:>9}")
+        max_damp_str = f"{max_damp:.5f}" if isinstance(max_damp, float) else "—"
+        elevated_str = str(elevated) if elevated != "—" else "—"
+        print(
+            f"{row['method']:<28} | {ppl_str:>10} | {loss_str:>14} | "
+            f"{max_damp_str:>9} | {elevated_str:>9} | {hooks_str:>9}"
+        )
+    print(
+        "\nNote: mean quant loss is computed in each method's GPTQ coordinates and is "
+        "not directly comparable across identity vs random_orthogonal."
+    )
 
 
 def main() -> int:
@@ -242,6 +277,23 @@ def main() -> int:
         action="store_true",
         help="Pass trust_remote_code=True when resolving/loading the model.",
     )
+    parser.add_argument(
+        "--damp-percent",
+        type=float,
+        default=0.01,
+        help="Hessian damp_percent for all methods (fair comparison default).",
+    )
+    parser.add_argument(
+        "--inference-precision",
+        default="float16",
+        choices=("float16", "float32", "bfloat16"),
+        help="T_X storage precision for random_orthogonal inference hooks.",
+    )
+    parser.add_argument(
+        "--legacy-random-orthogonal-damp",
+        action="store_true",
+        help="Use historical damp_percent=0.05 for random_orthogonal only (unfair ablation).",
+    )
     args = parser.parse_args()
 
     methods: list[WeightPrepareMode] = []
@@ -254,6 +306,8 @@ def main() -> int:
     print(f"Model: {args.model_id}")
     print(f"Device: {args.device}")
     print(f"Methods: {methods}")
+    print(f"damp_percent: {args.damp_percent} (legacy random_orthogonal damp: {args.legacy_random_orthogonal_damp})")
+    print(f"random_orthogonal inference_precision: {args.inference_precision}")
 
     backend = _resolve_backend(args.device)
     load_kwargs = {}
@@ -318,12 +372,16 @@ def main() -> int:
                 eval_n_tokens=args.eval_n_tokens,
                 work_dir=work_dir,
                 trust_remote_code=args.trust_remote_code,
+                damp_percent=args.damp_percent,
+                inference_precision=args.inference_precision,
+                legacy_random_orthogonal_damp=args.legacy_random_orthogonal_damp,
             )
             results.append(row)
             ppl = row["perplexity"]
             print(
                 f"{row['method']}: PPL={ppl:.4f} "
-                f"loss={row['mean_quant_loss']} hooks={row['t_x_hooks']}"
+                f"loss={row['mean_quant_loss']} max_damp={row.get('max_damp')} "
+                f"elevated_damp={row.get('modules_with_elevated_damp')} hooks={row['t_x_hooks']}"
             )
     finally:
         if cleanup:
@@ -344,6 +402,9 @@ def main() -> int:
                     "calib_concat_size": args.calib_concat_size,
                     "eval_seq_len": args.eval_seq_len,
                     "eval_n_tokens": args.eval_n_tokens,
+                    "damp_percent": args.damp_percent,
+                    "inference_precision": args.inference_precision,
+                    "legacy_random_orthogonal_damp": args.legacy_random_orthogonal_damp,
                     "results": results,
                 },
                 handle,

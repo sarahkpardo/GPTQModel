@@ -68,7 +68,6 @@ def _build_quantize_config(*, weight_prepare: str, group_size: int = 128, model_
                 "opt_seed": 42,
             }
         ]
-        kwargs["damp_percent"] = 0.05
     return QuantizeConfig(**kwargs)
 
 

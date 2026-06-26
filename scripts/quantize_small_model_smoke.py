@@ -135,7 +135,6 @@ def _build_quantize_config(
             }
         ]
         kwargs["weight_export"] = {"format": "gptq"}
-        kwargs["damp_percent"] = 0.05
         if pipeline == "legacy":
             kwargs.setdefault("weight_quantize", {"method": "gptq"})
     if weight_prepare == "paroquant":

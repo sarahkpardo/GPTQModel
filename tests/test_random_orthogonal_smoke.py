@@ -176,7 +176,7 @@ def test_tiny_qwen3_moe_random_orthogonal_gptq_smoke(tmp_path: Path):
         bits=4,
         group_size=32,
         desc_act=False,
-        damp_percent=0.05,
+        damp_percent=0.01,
         damp_auto_increment=0.01,
         device="cpu",
         moe=MoEConfig(routing=ExpertsRoutingOverride()),
