@@ -106,12 +106,9 @@ def test_hessian_congruence_preserves_spectrum():
     h = torch.randn(8, 8)
     h = h @ h.T
     h_prime = backend.transform_hessian(h.clone(), state)
-    block_size = int(state.payload["group_size"])
-    for block_idx in range(h.shape[0] // block_size):
-        sl = slice(block_idx * block_size, (block_idx + 1) * block_size)
-        evals, _ = torch.linalg.eigh(h[sl, sl])
-        evals_prime, _ = torch.linalg.eigh(h_prime[sl, sl])
-        assert torch.allclose(torch.sort(evals).values, torch.sort(evals_prime).values, atol=1e-4, rtol=1e-4)
+    evals, _ = torch.linalg.eigh(h)
+    evals_prime, _ = torch.linalg.eigh(h_prime)
+    assert torch.allclose(torch.sort(evals).values, torch.sort(evals_prime).values, atol=1e-4, rtol=1e-4)
 
 
 def test_inference_data_layout():

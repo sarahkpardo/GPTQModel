@@ -1615,6 +1615,9 @@ def ModelLoader(cls):
             model.seqlen = 4096
 
         if format_code != FORMAT.EXL3:
+            from ..ptq.inference_hooks import load_ptq_inference_buffers_from_checkpoint
+
+            load_ptq_inference_buffers_from_checkpoint(model, model_save_name)
             # Any post-initialization that require device information, for example buffers initialization on device.
             model = gptqmodel_post_init(model, use_act_order=qcfg.desc_act, quantize_config=qcfg)
 

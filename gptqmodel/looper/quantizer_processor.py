@@ -508,7 +508,7 @@ class QuantizerProcessor(LoopProcessor):
             return
 
         from ..ptq.inference_data import InferenceTransformData
-        from ..ptq.inference_hooks import register_activation_pre_hook
+        from ..ptq.inference_hooks import persist_ptq_inference_buffers, register_activation_pre_hook
 
         extra = module.state.pop("ptq_weight_quant_extra", None) or {}
         inference = transform.inference
@@ -519,8 +519,26 @@ class QuantizerProcessor(LoopProcessor):
             elif isinstance(raw, dict):
                 inference = InferenceTransformData.from_dict(raw)
 
+        resolved = inference
+        if resolved is None and transform is not None:
+            from ..ptq.config import TransformPrepareConfig
+            from ..ptq.transforms.registry import build_transform_backend
+
+            backend = build_transform_backend(TransformPrepareConfig(method=transform.method))
+            resolved = backend.get_inference_data(transform)
+
+        if resolved is not None and not resolved.is_identity():
+            pad = 0
+            if transform.payload:
+                pad = int(transform.payload.get("pad", 0) or 0)
+            persist_ptq_inference_buffers(
+                qmodule,
+                resolved,
+                method=transform.method,
+                pad=pad,
+            )
+
         register_activation_pre_hook(qmodule, transform, inference=inference)
-        resolved = inference or transform.inference
         if resolved is not None and not resolved.is_identity():
             module.state["ptq_inference_transform"] = resolved.to_dict()
         module.state.pop(PTQ_TRANSFORM_KEY, None)

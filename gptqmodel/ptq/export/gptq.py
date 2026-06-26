@@ -10,7 +10,7 @@ from ...looper.named_module import NamedModule
 from ..config import ExportTargetConfig
 from ..context import TransformState, WeightQuantState
 from ..inference_data import InferenceTransformData
-from ..inference_hooks import register_activation_pre_hook
+from ..inference_hooks import persist_ptq_inference_buffers, register_activation_pre_hook
 
 
 class GptqExport:
@@ -44,6 +44,19 @@ class GptqExport:
         if inference_data is None or inference_data.is_identity():
             return
 
+        method = transform.method if transform is not None else inference_data.transform_type
+        pad = 0
+        if transform is not None and transform.payload:
+            pad = int(transform.payload.get("pad", 0) or 0)
+        elif inference_data.extra:
+            pad = int(inference_data.extra.get("pad", 0) or 0)
+
+        persist_ptq_inference_buffers(
+            target,
+            inference_data,
+            method=method,
+            pad=pad,
+        )
         register_activation_pre_hook(target, transform, inference=inference_data)
         if isinstance(submodule, NamedModule):
             submodule.state["ptq_inference_transform"] = inference_data.to_dict()

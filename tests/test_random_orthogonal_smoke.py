@@ -36,7 +36,11 @@ pytestmark = [pytest.mark.cpu, pytest.mark.slow]
 _CALIBRATION_TEXTS = [
     "random orthogonal ptq calibration sample one with enough tokens for hessian capture",
     "random orthogonal ptq calibration sample two with repeated expert routing words",
-] * 2
+    "random orthogonal ptq calibration sample three for stable positive definite hessian",
+    "random orthogonal ptq calibration sample four covering all moe expert paths",
+    "random orthogonal ptq calibration sample five activates every expert gate projection",
+    "random orthogonal ptq calibration sample six provides additional activation rows",
+] * 8
 
 
 def _parse_loss(value) -> float:
@@ -170,6 +174,8 @@ def test_tiny_qwen3_moe_random_orthogonal_gptq_smoke(tmp_path: Path):
         bits=4,
         group_size=32,
         desc_act=False,
+        damp_percent=0.05,
+        damp_auto_increment=0.01,
         device="cpu",
         moe=MoEConfig(routing=ExpertsRoutingOverride()),
         weight_prepare=[
@@ -234,3 +240,14 @@ def test_tiny_qwen3_moe_random_orthogonal_gptq_smoke(tmp_path: Path):
         for suffix in ("gate_proj", "up_proj", "down_proj"):
             name = f"model.model.layers.0.mlp.experts.{expert_index}.{suffix}"
             assert isinstance(modules[name], TorchLinear), name
+
+    hooked = [
+        name
+        for name, mod in modules.items()
+        if hasattr(mod, "ptq_t_x_matrices")
+        and isinstance(getattr(mod, "ptq_t_x_matrices"), torch.Tensor)
+        and mod.ptq_t_x_matrices.numel() > 0
+    ]
+    assert hooked, "expected persistent T_X buffers after reload"
+    for name in hooked:
+        assert len(modules[name]._forward_pre_hooks) > 0, name

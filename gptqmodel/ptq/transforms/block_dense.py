@@ -14,13 +14,13 @@ Conventions (input-axis blocks of size ``G``):
   - conv1d: ``W[sl, :] = Q @ W[sl, :]``
 - Online activation transform with stored ``T_X = Q.T`` (shape ``(G, G, C)``):
   ``x[:, sl] = x[:, sl] @ T_X[:, :, i]``  (equivalently ``x @ Q.T`` per block)
-- Hessian congruence (orthogonal ``Q``): ``H'[sl, sl] = Q @ H[sl, sl] @ Q.T``
+- Hessian congruence (orthogonal ``Q``): ``H' = Q H Q^T`` block-wise, including cross blocks
 - Bilinear constraint: ``T_X @ T_W = I``
 """
 
 from __future__ import annotations
 
-from typing import List, Sequence, Tuple
+from typing import Callable, List, Sequence, Tuple
 
 import torch
 
@@ -180,7 +180,11 @@ def apply_block_transform_to_hessian(
     block_size: int,
     pad: int,
 ) -> torch.Tensor:
-    """Congruence-transform ``H`` with orthogonal blocks ``Q``."""
+    """Congruence-transform ``H`` with block-diagonal orthogonal ``Q``.
+
+    Uses the full congruence ``H' = Q H Q^T``, including cross blocks
+    ``H'[i, j] = Q_i H[i, j] Q_j^T``.
+    """
     num_columns = hessian.shape[0]
     padded, _, num_blocks = pad_columns(num_columns, block_size)
     if pad > 0:
@@ -190,14 +194,18 @@ def apply_block_transform_to_hessian(
         h_work = hessian.clone()
 
     device = hessian.device
-    dtype = hessian.dtype
     blocks = _resolve_blocks(t_w_blocks, device, torch.float32)
-    h_out = h_work.clone()
-    for block_idx in range(num_blocks):
-        sl = slice(block_idx * block_size, (block_idx + 1) * block_size)
-        q = blocks[block_idx]
-        h_blk = h_out[sl, sl].float()
-        h_out[sl, sl] = (q @ h_blk @ q.T).to(dtype=h_work.dtype)
+    h_float = h_work.float()
+    h_out = h_work.new_zeros(h_work.shape)
+    for row_idx in range(num_blocks):
+        row_sl = slice(row_idx * block_size, (row_idx + 1) * block_size)
+        q_row = blocks[row_idx]
+        for col_idx in range(num_blocks):
+            col_sl = slice(col_idx * block_size, (col_idx + 1) * block_size)
+            q_col = blocks[col_idx]
+            h_out[row_sl, col_sl] = (q_row @ h_float[row_sl, col_sl] @ q_col.T).to(
+                dtype=h_work.dtype
+            )
 
     return h_out[:num_columns, :num_columns]
 
@@ -246,11 +254,57 @@ def build_inference_transform_data(
     *,
     block_size: int,
     precision: torch.dtype,
+    pad: int = 0,
 ) -> InferenceTransformData:
     """Build dense ``(G, G, C)`` inference payload."""
+    extra = {"pad": int(pad)} if pad else {}
     return InferenceTransformData(
         transform_type="dense",
         T_X_matrices=t_x_matrices.detach().cpu(),
         precision=precision,
         block_size=int(block_size),
+        extra=extra,
     )
+
+
+def _resolve_inference_pad(inference: InferenceTransformData, *, pad: int | None = None) -> int:
+    if pad is not None:
+        return int(pad)
+    return int(inference.extra.get("pad", 0) or 0)
+
+
+def build_dense_activation_hook(
+    inference: InferenceTransformData,
+    *,
+    pad: int | None = None,
+) -> Callable[..., None]:
+    """Return a forward pre-hook applying dense block ``T_X`` to activations."""
+    if inference.T_X_matrices is None:
+        raise ValueError("Dense activation hook requires T_X_matrices.")
+
+    t_x_matrices = inference.T_X_matrices
+    block_size = int(inference.block_size)
+    resolved_pad = _resolve_inference_pad(inference, pad=pad)
+    inference_dtype = inference.precision
+
+    def _hook(_module, args, kwargs):
+        if not args and "input" not in kwargs:
+            return None
+        x = args[0] if args else kwargs.get("input")
+        if not isinstance(x, torch.Tensor):
+            return None
+        original_columns = x.shape[-1]
+        transformed = apply_block_transform_to_activation(
+            x,
+            t_x_matrices.to(device=x.device, dtype=inference_dtype),
+            block_size=block_size,
+            pad=resolved_pad,
+            original_columns=original_columns,
+        )
+        if args:
+            new_args = (transformed, *args[1:])
+            return new_args, kwargs
+        kwargs["input"] = transformed
+        return args, kwargs
+
+    return _hook

@@ -61,6 +61,21 @@ _DEFAULT_CALIBRATION = [
     "Identity transforms should preserve legacy GPTQ behavior on full models.",
 ] * 2
 
+_RANDOM_ORTHOGONAL_CALIBRATION = [
+    "Random orthogonal transforms rotate weight blocks to reduce quantization error.",
+    "Calibration data must provide enough activation samples for positive definite Hessians.",
+    "Each transformer layer captures statistics during a forward pass over calibration batches.",
+    "Mixture of experts models require routing overrides so every expert sees calibration data.",
+    "Block diagonal orthogonal matrices preserve the bilinear inner product at inference time.",
+    "GPTQ uses the transformed Hessian after offline weight rotation during quantization.",
+] * 8
+
+
+def _resolve_calibration(weight_prepare: WeightPrepareMode | None) -> list[str]:
+    if weight_prepare == "random_orthogonal":
+        return list(_RANDOM_ORTHOGONAL_CALIBRATION)
+    return list(_DEFAULT_CALIBRATION)
+
 
 def _build_quantize_config(
     pipeline: PipelineMode,
@@ -97,6 +112,7 @@ def _build_quantize_config(
             }
         ]
         kwargs["weight_export"] = {"format": "gptq"}
+        kwargs["damp_percent"] = 0.05
         if pipeline == "legacy":
             kwargs.setdefault("weight_quantize", {"method": "gptq"})
     if weight_prepare == "paroquant":
@@ -125,7 +141,12 @@ def _build_quantize_config(
     return QuantizeConfig(**kwargs)
 
 
-def _build_tiny_qwen3_moe_fixture(model_dir: Path, *, moe_intermediate_size: int = 32) -> str:
+def _build_tiny_qwen3_moe_fixture(
+    model_dir: Path,
+    *,
+    moe_intermediate_size: int = 32,
+    calibration_texts: list[str] | None = None,
+) -> str:
     """Build and save a tiny Qwen3 MoE checkpoint; return the model directory path."""
     from tokenizers import Tokenizer
     from tokenizers.models import WordLevel
@@ -134,7 +155,7 @@ def _build_tiny_qwen3_moe_fixture(model_dir: Path, *, moe_intermediate_size: int
     from transformers import PreTrainedTokenizerFast
     from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeConfig, Qwen3MoeForCausalLM
 
-    calibration_texts = list(_DEFAULT_CALIBRATION)
+    texts = list(calibration_texts or _DEFAULT_CALIBRATION)
     config = Qwen3MoeConfig(
         num_hidden_layers=1,
         hidden_size=64,
@@ -158,7 +179,7 @@ def _build_tiny_qwen3_moe_fixture(model_dir: Path, *, moe_intermediate_size: int
     trainer = WordLevelTrainer(
         special_tokens=["[PAD]", "[UNK]", "[BOS]", "[EOS]"],
     )
-    tokenizer.train_from_iterator(calibration_texts, trainer=trainer)
+    tokenizer.train_from_iterator(texts, trainer=trainer)
     fast_tokenizer = PreTrainedTokenizerFast(
         tokenizer_object=tokenizer,
         bos_token="[BOS]",
@@ -176,13 +197,65 @@ def _resolve_model_source(
     model_fixture: ModelFixture,
     work_dir: Path,
     moe_intermediate_size: int = 32,
+    calibration_texts: list[str] | None = None,
 ) -> str:
     if model_fixture == "tiny-qwen3-moe":
         return _build_tiny_qwen3_moe_fixture(
             work_dir / "tiny-qwen3-moe",
             moe_intermediate_size=moe_intermediate_size,
+            calibration_texts=calibration_texts,
         )
     return model_id
+
+
+def _count_ptq_hooks(model: GPTQModel) -> int:
+    import torch
+
+    count = 0
+    for module in model.model.modules():
+        t_x = getattr(module, "ptq_t_x_matrices", None)
+        if isinstance(t_x, torch.Tensor) and t_x.numel() > 0 and module._forward_pre_hooks:
+            count += 1
+    return count
+
+
+def _check_parity(
+    *,
+    model_source: str,
+    reloaded: GPTQModel,
+    prompt: str,
+    weight_prepare: WeightPrepareMode | None,
+) -> None:
+    import torch
+    from transformers import AutoModelForCausalLM
+
+    if weight_prepare != "random_orthogonal":
+        return
+
+    hook_count = _count_ptq_hooks(reloaded)
+    if hook_count == 0:
+        raise SystemExit(
+            "FAIL: random_orthogonal parity check found no rehydrated T_X hooks after reload."
+        )
+    print(f"Parity: rehydrated T_X hooks on {hook_count} module(s).")
+
+    reference = AutoModelForCausalLM.from_pretrained(model_source)
+    reference.eval()
+    reloaded.model.eval()
+    tokenizer = reloaded.tokenizer
+    batch = tokenizer(prompt, return_tensors="pt")
+    with torch.no_grad():
+        ref_logits = reference(**batch).logits
+        quant_logits = reloaded.model(**batch).logits
+    if not torch.isfinite(quant_logits).all():
+        raise SystemExit("FAIL: random_orthogonal parity check produced non-finite logits.")
+    rel_err = (quant_logits - ref_logits).abs().mean() / ref_logits.abs().mean().clamp(min=1e-6)
+    print(f"Parity: mean relative logits error vs fp32 reference = {rel_err.item():.4f}")
+    if rel_err.item() > 0.75:
+        raise SystemExit(
+            f"FAIL: random_orthogonal logits diverged from fp32 reference (rel_err={rel_err.item():.4f})."
+        )
+    print("PASS: random_orthogonal parity check succeeded.")
 
 
 def _resolve_backend(device: str, *, weight_export: WeightExportMode | None = None):
@@ -210,6 +283,7 @@ def _run_pipeline_smoke(
     weight_prepare: WeightPrepareMode | None = None,
     weight_export: WeightExportMode | None = None,
     weight_quantize: WeightQuantizeMode | None = None,
+    check_parity: bool = False,
 ) -> list[int]:
     moe = model_fixture == "tiny-qwen3-moe"
     qcfg = _build_quantize_config(
@@ -234,6 +308,7 @@ def _run_pipeline_smoke(
         model_fixture=model_fixture,
         work_dir=work_dir,
         moe_intermediate_size=moe_intermediate_size,
+        calibration_texts=calibration,
     )
 
     print(f"Loading {model_source!r} (pipeline={pipeline}, fixture={model_fixture}, factorization=cholesky)...")
@@ -274,6 +349,13 @@ def _run_pipeline_smoke(
     )
     decoded = reloaded.tokenizer.decode(token_ids[0], skip_special_tokens=True)
     print(f"Generation: {decoded}")
+    if check_parity:
+        _check_parity(
+            model_source=model_source,
+            reloaded=reloaded,
+            prompt=prompt,
+            weight_prepare=weight_prepare,
+        )
     del reloaded
     return token_ids[0].tolist()
 
@@ -320,6 +402,11 @@ def main() -> int:
     parser.add_argument("--prompt", default="The capital of France is")
     parser.add_argument("--max-new-tokens", type=int, default=16)
     parser.add_argument(
+        "--check-parity",
+        action="store_true",
+        help="After reload, verify random_orthogonal T_X hooks and logits vs fp32 reference.",
+    )
+    parser.add_argument(
         "--compare",
         action="store_true",
         help="Run legacy and ptq pipelines and compare generated token ids.",
@@ -337,6 +424,8 @@ def main() -> int:
     if args.compare and args.pipeline != "legacy":
         print("Note: --compare runs both legacy and ptq; ignoring --pipeline.", file=sys.stderr)
 
+    calibration = _resolve_calibration(args.weight_prepare)
+
     with tempfile.TemporaryDirectory(prefix="gptqmodel-smoke-") as tmp_root:
         tmp_path = Path(tmp_root)
         if args.compare:
@@ -346,7 +435,7 @@ def main() -> int:
                 work_dir=tmp_path,
                 pipeline="legacy",
                 output_dir=tmp_path / "legacy",
-                calibration=_DEFAULT_CALIBRATION,
+                calibration=calibration,
                 bits=args.bits,
                 group_size=args.group_size,
                 batch_size=args.batch_size,
@@ -360,7 +449,7 @@ def main() -> int:
                 work_dir=tmp_path,
                 pipeline="ptq",
                 output_dir=tmp_path / "ptq",
-                calibration=_DEFAULT_CALIBRATION,
+                calibration=calibration,
                 bits=args.bits,
                 group_size=args.group_size,
                 batch_size=args.batch_size,
@@ -383,7 +472,7 @@ def main() -> int:
             work_dir=tmp_path,
             pipeline=args.pipeline,
             output_dir=output_dir,
-            calibration=_DEFAULT_CALIBRATION,
+            calibration=calibration,
             bits=args.bits,
             group_size=args.group_size,
             batch_size=args.batch_size,
@@ -393,6 +482,7 @@ def main() -> int:
             weight_prepare=args.weight_prepare,
             weight_export=args.weight_export,
             weight_quantize=args.weight_quantize,
+            check_parity=args.check_parity,
         )
         if args.output_dir is not None:
             print(f"Checkpoint kept at {args.output_dir}")

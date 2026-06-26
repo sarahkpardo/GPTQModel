@@ -336,6 +336,13 @@ class GptqQuantizer:
                     uses_qr_factorization=self._uses_qr_factorization(),
                 )
 
+            if Hinv is None and not fallback_configured:
+                raise RuntimeError(
+                    f"Quantization: Module `{self.name}` -> Hessian inverse failed after damping "
+                    f"recovery (nsamples={self.nsamples}). Increase calibration data or "
+                    f"`damp_percent` (last tried={damp:.5f})."
+                )
+
         Losses = torch.zeros_like(W)
         Q = torch.zeros_like(W)
 

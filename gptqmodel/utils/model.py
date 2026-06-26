@@ -1242,6 +1242,10 @@ def gptqmodel_post_init(model, use_act_order: bool, quantize_config: QuantizeCon
         elif isinstance(submodule, BaseQuantLinear):
             submodule.post_init()
 
+    from ..ptq.inference_hooks import rehydrate_ptq_inference_hooks
+
+    rehydrate_ptq_inference_hooks(model)
+
     torch_empty_cache()
 
     return model

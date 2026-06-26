@@ -11,10 +11,11 @@ import torch
 from ..config import TransformPrepareConfig
 from ..context import ModuleCalibContext, TransformState
 from ..protocols import TransformMode
+from ..inference_data import InferenceTransformData
 from .block_dense import (
-    apply_block_transform_to_activation,
     apply_block_transform_to_hessian,
     apply_block_transform_to_weight,
+    build_dense_activation_hook,
     build_inference_transform_data,
     generate_random_orthogonal_blocks,
     pad_columns,
@@ -148,35 +149,19 @@ class RandomOrthogonalTransform:
             t_x,
             block_size=int(payload["group_size"]),
             precision=inference_dtype,
+            pad=int(payload.get("pad", 0)),
         )
 
     def activation_pre_hook(self, state: TransformState) -> Callable[..., None]:
+        if state.inference is not None:
+            return build_dense_activation_hook(state.inference)
         payload = state.payload
-        t_x_matrices = payload["T_X_matrices"]
-        block_size = int(payload["group_size"])
-        pad = int(payload.get("pad", 0))
-        inference_dtype = _resolve_inference_dtype(
-            {"inference_precision": payload.get("inference_precision", "float16")}
+        inference = build_inference_transform_data(
+            payload["T_X_matrices"],
+            block_size=int(payload["group_size"]),
+            precision=_resolve_inference_dtype(
+                {"inference_precision": payload.get("inference_precision", "float16")}
+            ),
+            pad=int(payload.get("pad", 0)),
         )
-
-        def _hook(_module, args, kwargs):
-            if not args and "input" not in kwargs:
-                return None
-            x = args[0] if args else kwargs.get("input")
-            if not isinstance(x, torch.Tensor):
-                return None
-            original_columns = x.shape[-1]
-            transformed = apply_block_transform_to_activation(
-                x,
-                t_x_matrices.to(device=x.device, dtype=inference_dtype),
-                block_size=block_size,
-                pad=pad,
-                original_columns=original_columns,
-            )
-            if args:
-                new_args = (transformed, *args[1:])
-                return new_args, kwargs
-            kwargs["input"] = transformed
-            return args, kwargs
-
-        return _hook
+        return build_dense_activation_hook(inference)

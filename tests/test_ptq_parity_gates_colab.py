@@ -10,9 +10,10 @@ COLAB_PARITY_COMMANDS = [
     "python scripts/compare_pipeline_intermediates.py",
     "python scripts/compare_paroquant_transform_intermediates.py --rotation-epochs 1 --finetune-epochs 0",
     "python scripts/quantize_small_model_smoke.py --compare",
-    "pytest tests/test_ptq_pipeline.py tests/test_moe_ptq_smoke.py tests/test_ptq_three_component_refactor.py tests/test_paroquant_transform_parity.py tests/test_random_orthogonal_transform.py tests/test_random_orthogonal_smoke.py",
+    "pytest tests/test_ptq_pipeline.py tests/test_moe_ptq_smoke.py tests/test_ptq_three_component_refactor.py tests/test_paroquant_transform_parity.py tests/test_random_orthogonal_transform.py tests/test_random_orthogonal_smoke.py tests/test_random_orthogonal_parity.py",
     "pytest tests/test_moe_paroquant_ptq_gpu_smoke.py -q",
     "python scripts/quantize_small_model_smoke.py --model-fixture tiny-qwen3-moe --device cuda --weight-prepare paroquant --weight-export paroquant",
+    "python scripts/quantize_small_model_smoke.py --model-fixture tiny-qwen3-moe --device cpu --pipeline ptq --weight-prepare random_orthogonal --weight-quantize gptq --check-parity",
 ]
 
 
