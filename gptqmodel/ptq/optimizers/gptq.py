@@ -38,7 +38,6 @@ class GptqWeightOptimizer:
         qcfg=None,
         expected_nsamples: Optional[float] = None,
     ) -> WeightQuantState:
-        del transform
         active_qcfg = qcfg or self.qcfg
         module_name = _module_label(module)
 

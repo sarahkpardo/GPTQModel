@@ -8,8 +8,9 @@ import pytest
 
 COLAB_PARITY_COMMANDS = [
     "python scripts/compare_pipeline_intermediates.py",
+    "python scripts/compare_paroquant_transform_intermediates.py --rotation-epochs 1 --finetune-epochs 0",
     "python scripts/quantize_small_model_smoke.py --compare",
-    "pytest tests/test_ptq_pipeline.py tests/test_moe_ptq_smoke.py tests/test_ptq_three_component_refactor.py",
+    "pytest tests/test_ptq_pipeline.py tests/test_moe_ptq_smoke.py tests/test_ptq_three_component_refactor.py tests/test_paroquant_transform_parity.py",
 ]
 
 
