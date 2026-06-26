@@ -38,6 +38,7 @@ from ..ptq.stats import StatisticsCollector
 from ..quantization.config import QuantizeConfig
 from ..quantization.gptq import get_number_of_rows_and_cols
 from ..utils.device import get_device
+from ..utils.looper_helpers import normalize_device_like
 from ..utils.logger import setup_logger
 
 log = setup_logger()
@@ -106,7 +107,9 @@ class SequentialPTQProcessor(QuantizerProcessor):
         from ..utils.paroquant import prewarm_paroquant_rotation_extension
 
         opts = paro_cfg.options
-        device = get_device(self.qcfg.device) or get_device(None) or "cuda"
+        device = normalize_device_like(self.qcfg.device)
+        if device is None and torch.cuda.is_available():
+            device = torch.device("cuda")
         prewarmed = prewarm_paroquant_rotation_extension(
             fused_rotation=bool(opts.get("opt_fused_rotation", True)),
             group_size=int(opts.get("group_size", self.qcfg.group_size)),
@@ -282,6 +285,9 @@ class SequentialPTQProcessor(QuantizerProcessor):
         module.state.pop("_ptq_prepare_pending", None)
         module.state[PTQ_CONTEXT_KEY] = ctx
 
+    def _transform_requires_grad(self) -> bool:
+        return any(cfg.method not in {"identity", "none"} for cfg in self.prepare_configs)
+
     def process(
         self,
         module: NamedModule,
@@ -293,7 +299,11 @@ class SequentialPTQProcessor(QuantizerProcessor):
     ):
         del subset, previous_subset, subset_index, subset_total
         ctx = self._finalize_stats_context(module)
-        self._apply_transform(module, ctx, device)
+        if self._transform_requires_grad():
+            with torch.inference_mode(False), torch.enable_grad():
+                self._apply_transform(module, ctx, device)
+        else:
+            self._apply_transform(module, ctx, device)
         self._process_split(module, device=device)
 
     def submodule_finalize(self, module: NamedModule, model: BaseQModel, **kwargs):

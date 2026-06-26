@@ -49,7 +49,10 @@ def resolve_paroquant_activation_inputs(
         inputs = torch.empty((0, ctx.columns), dtype=weight.dtype, device=weight.device)
     if inputs.numel() == 0:
         return torch.empty((0, weight.shape[1]), dtype=weight.dtype, device=weight.device)
-    return inputs.to(device=weight.device)
+    inputs = inputs.to(device=weight.device)
+    if hasattr(inputs, "is_inference") and inputs.is_inference():
+        inputs = inputs.clone()
+    return inputs
 
 
 def resolve_paroquant_quant_params(

@@ -16,7 +16,7 @@ from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeConfig, Qwe
 
 from gptqmodel import BACKEND, GPTQModel, QuantizeConfig
 from gptqmodel.nn_modules.qlinear.paroquant import ParoLinear
-from gptqmodel.quantization.config import ExpertsRoutingOverride, FORMAT, METHOD, MoEConfig
+from gptqmodel.quantization.config import ExpertsRoutingOverride, MoEConfig
 from gptqmodel.utils.paroquant import prewarm_paroquant_rotation_extension
 
 pytestmark = [pytest.mark.cuda, pytest.mark.slow]
@@ -80,8 +80,6 @@ def _paroquant_moe_qcfg() -> QuantizeConfig:
         group_size=32,
         sym=True,
         desc_act=False,
-        method=METHOD.PARO,
-        format=FORMAT.PAROQUANT,
         device="cuda",
         moe=MoEConfig(routing=ExpertsRoutingOverride()),
         hessian={"factorization": "cholesky", "row_buffer_max_rows": 256},

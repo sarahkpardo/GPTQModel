@@ -578,6 +578,15 @@ def _sample_activation_rows(inputs: torch.Tensor, max_rows: int) -> torch.Tensor
     return rows.index_select(0, indices)
 
 
+def _fused_rotation_runtime_supported(*, group_size: int, krot: int, device: torch.device) -> bool:
+    """Return True when the fused CUDA rotation kernel can service this shape."""
+    return (
+        device.type == "cuda"
+        and int(group_size) in {128}
+        and int(krot) in {1, 8}
+    )
+
+
 def _apply_rotation(
     x: torch.Tensor,
     pairs: torch.Tensor,
@@ -597,7 +606,11 @@ def _apply_rotation(
         else bool(fused_rotation)
     )
 
-    if use_fused_rotation:
+    if use_fused_rotation and _fused_rotation_runtime_supported(
+        group_size=group_size,
+        krot=int(pairs.shape[0]),
+        device=x.device,
+    ):
         scale_tensor = None if scales is None else scales.view(1, -1)
         if not (
             x.requires_grad
@@ -1317,6 +1330,14 @@ def _should_use_paroquant_stage_cudagraph(
     if inputs_train.device.type != "cuda":
         return False
     if not bool(getattr(model, "fused_rotation", False)):
+        return False
+    group_size = int(getattr(model, "group_size", 128))
+    krot = int(getattr(model, "theta", torch.empty(0)).shape[0]) if hasattr(model, "theta") else 0
+    if not _fused_rotation_runtime_supported(
+        group_size=group_size,
+        krot=krot,
+        device=inputs_train.device,
+    ):
         return False
     return inputs_train.shape[0] >= max(1, int(batch_size))
 

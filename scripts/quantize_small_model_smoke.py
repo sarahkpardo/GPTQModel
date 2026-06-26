@@ -71,8 +71,6 @@ def _build_quantize_config(
     weight_prepare: WeightPrepareMode | None = None,
     weight_export: WeightExportMode | None = None,
 ) -> QuantizeConfig:
-    from gptqmodel.quantization.config import FORMAT, METHOD
-
     kwargs = dict(
         bits=bits,
         group_size=group_size,
@@ -89,8 +87,6 @@ def _build_quantize_config(
     if pipeline == "ptq":
         kwargs["weight_prepare"] = [{"method": "identity"}]
     if weight_prepare == "paroquant":
-        kwargs["method"] = METHOD.PARO
-        kwargs["format"] = FORMAT.PAROQUANT
         kwargs["weight_prepare"] = [
             {
                 "method": "paroquant",
@@ -106,8 +102,6 @@ def _build_quantize_config(
         ]
         kwargs["weight_quantize"] = {"method": "paroquant"}
     if weight_export == "paroquant":
-        kwargs["method"] = METHOD.PARO
-        kwargs["format"] = FORMAT.PAROQUANT
         kwargs["weight_export"] = {"format": "paroquant"}
     if moe:
         from gptqmodel.quantization.config import ExpertsRoutingOverride, MoEConfig
