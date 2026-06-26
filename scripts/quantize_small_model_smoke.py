@@ -48,8 +48,10 @@ _require_runtime_deps()
 
 from gptqmodel import BACKEND, GPTQModel, QuantizeConfig  # noqa: E402
 
-PipelineMode = Literal["legacy", "ptq"]
+PipelineMode = Literal["legacy", "ptq", "ptq-paroquant-moe"]
 ModelFixture = Literal["hf", "tiny-qwen3-moe"]
+WeightPrepareMode = Literal["identity", "paroquant"]
+WeightExportMode = Literal["gptq", "paroquant"]
 
 _DEFAULT_CALIBRATION = [
     "GPTQModel quantizes language models with calibration data.",
@@ -66,7 +68,11 @@ def _build_quantize_config(
     group_size: int,
     device: str,
     moe: bool = False,
+    weight_prepare: WeightPrepareMode | None = None,
+    weight_export: WeightExportMode | None = None,
 ) -> QuantizeConfig:
+    from gptqmodel.quantization.config import FORMAT, METHOD
+
     kwargs = dict(
         bits=bits,
         group_size=group_size,
@@ -77,8 +83,32 @@ def _build_quantize_config(
         device=device,
         hessian={"factorization": "cholesky", "row_buffer_max_rows": 512},
     )
+    if pipeline == "ptq-paroquant-moe":
+        weight_prepare = "paroquant"
+        weight_export = "paroquant"
     if pipeline == "ptq":
         kwargs["weight_prepare"] = [{"method": "identity"}]
+    if weight_prepare == "paroquant":
+        kwargs["method"] = METHOD.PARO
+        kwargs["format"] = FORMAT.PAROQUANT
+        kwargs["weight_prepare"] = [
+            {
+                "method": "paroquant",
+                "opt_rotation_epochs": 1,
+                "opt_finetune_epochs": 0,
+                "krot": 2,
+                "opt_fused_rotation": True,
+                "opt_train_samples": 64,
+                "opt_validation_samples": 16,
+                "opt_batch_size": 16,
+                "group_size": group_size,
+            }
+        ]
+        kwargs["weight_quantize"] = {"method": "paroquant"}
+    if weight_export == "paroquant":
+        kwargs["method"] = METHOD.PARO
+        kwargs["format"] = FORMAT.PAROQUANT
+        kwargs["weight_export"] = {"format": "paroquant"}
     if moe:
         from gptqmodel.quantization.config import ExpertsRoutingOverride, MoEConfig
 
@@ -142,9 +172,11 @@ def _resolve_model_source(
     return model_id
 
 
-def _resolve_backend(device: str):
+def _resolve_backend(device: str, *, weight_export: WeightExportMode | None = None):
     if device == "cpu":
         return BACKEND.TORCH
+    if weight_export == "paroquant" and device.startswith("cuda"):
+        return BACKEND.PAROQUANT_CUDA
     return None
 
 
@@ -162,6 +194,8 @@ def _run_pipeline_smoke(
     device: str,
     prompt: str,
     max_new_tokens: int,
+    weight_prepare: WeightPrepareMode | None = None,
+    weight_export: WeightExportMode | None = None,
 ) -> list[int]:
     moe = model_fixture == "tiny-qwen3-moe"
     qcfg = _build_quantize_config(
@@ -170,8 +204,15 @@ def _run_pipeline_smoke(
         group_size=group_size,
         device=device,
         moe=moe,
+        weight_prepare=weight_prepare,
+        weight_export=weight_export,
     )
-    backend = _resolve_backend(device)
+    export_mode = weight_export
+    if pipeline == "ptq-paroquant-moe":
+        export_mode = "paroquant"
+    elif export_mode is None and qcfg.weight_export is not None:
+        export_mode = str(qcfg.weight_export.get("format", "gptq"))
+    backend = _resolve_backend(device, weight_export=export_mode if export_mode in {"gptq", "paroquant"} else None)
     model_source = _resolve_model_source(
         model_id=model_id,
         model_fixture=model_fixture,
@@ -180,8 +221,9 @@ def _run_pipeline_smoke(
 
     print(f"Loading {model_source!r} (pipeline={pipeline}, fixture={model_fixture}, factorization=cholesky)...")
     load_kwargs = {"quantize_config": qcfg}
-    if backend is not None:
-        load_kwargs["backend"] = backend
+    quantize_backend = BACKEND.TORCH if device.startswith("cuda") else backend
+    if quantize_backend is not None:
+        load_kwargs["backend"] = quantize_backend
     model = GPTQModel.load(model_source, **load_kwargs)
 
     print("Quantizing...")
@@ -189,8 +231,8 @@ def _run_pipeline_smoke(
         "batch_size": batch_size,
         "calibration_data_min_length": 1,
     }
-    if backend is not None:
-        quantize_kwargs["backend"] = backend
+    if quantize_backend is not None:
+        quantize_kwargs["backend"] = quantize_backend
     model.quantize(calibration, **quantize_kwargs)
 
     if output_dir.exists():
@@ -230,9 +272,22 @@ def main() -> int:
     )
     parser.add_argument(
         "--pipeline",
-        choices=("legacy", "ptq"),
+        choices=("legacy", "ptq", "ptq-paroquant-moe"),
         default="legacy",
-        help="legacy = implicit identity prepare; ptq = explicit weight_prepare identity",
+        help="legacy = implicit identity prepare; ptq = explicit weight_prepare identity; "
+        "ptq-paroquant-moe = tiny MoE ParoQuant PTQ preset",
+    )
+    parser.add_argument(
+        "--weight-prepare",
+        choices=("identity", "paroquant"),
+        default=None,
+        help="Override PTQ weight_prepare (default: pipeline preset)",
+    )
+    parser.add_argument(
+        "--weight-export",
+        choices=("gptq", "paroquant"),
+        default=None,
+        help="PTQ weight_export format (default: pipeline preset)",
     )
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--output-dir", type=Path, default=None)
@@ -249,6 +304,13 @@ def main() -> int:
     args = parser.parse_args()
     if args.model_fixture == "tiny-qwen3-moe" and args.group_size == 128:
         args.group_size = 32
+    if args.pipeline == "ptq-paroquant-moe":
+        if args.model_fixture != "tiny-qwen3-moe":
+            print("Note: ptq-paroquant-moe preset uses tiny-qwen3-moe fixture.", file=sys.stderr)
+            args.model_fixture = "tiny-qwen3-moe"
+        if args.device == "cpu":
+            print("Note: ptq-paroquant-moe preset requires CUDA; switching device to cuda.", file=sys.stderr)
+            args.device = "cuda"
 
     if args.compare and args.pipeline != "legacy":
         print("Note: --compare runs both legacy and ptq; ignoring --pipeline.", file=sys.stderr)
@@ -306,6 +368,8 @@ def main() -> int:
             device=args.device,
             prompt=args.prompt,
             max_new_tokens=args.max_new_tokens,
+            weight_prepare=args.weight_prepare,
+            weight_export=args.weight_export,
         )
         if args.output_dir is not None:
             print(f"Checkpoint kept at {args.output_dir}")

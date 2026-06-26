@@ -91,6 +91,35 @@ class SequentialPTQProcessor(QuantizerProcessor):
         self._collectors: Dict[str, StatisticsCollector] = {}
         self._collectors_by_module_id: Dict[int, StatisticsCollector] = {}
         self._collectors_by_short_name: Dict[str, StatisticsCollector] = {}
+        self._paroquant_prewarm_done = False
+
+    def _maybe_prewarm_paroquant(self) -> None:
+        if self._paroquant_prewarm_done:
+            return
+        paro_cfg = next(
+            (cfg for cfg in self.prepare_configs if cfg.method in {"paroquant", "paro"}),
+            None,
+        )
+        if paro_cfg is None:
+            return
+
+        from ..utils.paroquant import prewarm_paroquant_rotation_extension
+
+        opts = paro_cfg.options
+        device = get_device(self.qcfg.device) or get_device(None) or "cuda"
+        prewarmed = prewarm_paroquant_rotation_extension(
+            fused_rotation=bool(opts.get("opt_fused_rotation", True)),
+            group_size=int(opts.get("group_size", self.qcfg.group_size)),
+            krot=int(opts.get("krot", 8)),
+            device=device,
+        )
+        if not prewarmed:
+            log.info(
+                "SequentialPTQProcessor: ParoQuant fused rotation prewarm skipped "
+                f"(group_size={opts.get('group_size', self.qcfg.group_size)}, "
+                f"krot={opts.get('krot', 8)}); reference rotation will be used during fit."
+            )
+        self._paroquant_prewarm_done = True
 
     @staticmethod
     def _collector_key(module: NamedModule) -> str:
@@ -98,6 +127,7 @@ class SequentialPTQProcessor(QuantizerProcessor):
 
     def preprocess(self, module: NamedModule, fallback=None, **kwargs):
         del kwargs
+        self._maybe_prewarm_paroquant()
         qcfg_clone = clone_gptq_config_for_module(
             self.qcfg,
             module.full_name,
