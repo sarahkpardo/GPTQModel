@@ -232,9 +232,17 @@ class ParoLinear(AwqTorchLinear):
             out = out + self.bias.to(device=x_flat.device, dtype=x_flat.dtype)
         return out
 
+    def _cuda_awq_gemm_supported(self) -> bool:
+        """The fused AWQ CUDA GEMM requires aligned output channels and group size."""
+        if self.out_features % 64 != 0 or self.out_features % 8 != 0:
+            return False
+        if self.group_size % 32 != 0:
+            return False
+        return self.out_features % self.group_size == 0
+
     def _forward_cuda_awq_kernel(self, x_flat: torch.Tensor) -> Optional[torch.Tensor]:
         """Fast path that feeds rotated activations into the AWQ CUDA GEMM kernel."""
-        if x_flat.device.type != "cuda":
+        if x_flat.device.type != "cuda" or not self._cuda_awq_gemm_supported():
             return None
 
         compute_dtype = x_flat.dtype if x_flat.dtype in (torch.float16, torch.bfloat16) else torch.float16

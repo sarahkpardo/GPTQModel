@@ -50,7 +50,7 @@ def _build_fixture(model_dir: Path) -> Qwen3MoeConfig:
         num_hidden_layers=1,
         hidden_size=64,
         intermediate_size=128,
-        moe_intermediate_size=32,
+        moe_intermediate_size=64,
         num_attention_heads=4,
         num_key_value_heads=4,
         num_experts=4,

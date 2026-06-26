@@ -307,6 +307,7 @@ class QuantizerProcessor(LoopProcessor):
             avg_loss=avg_loss,
             damp_percent=damp_percent,
             nsamples=nsamples,
+            weight_quant_extra=weight_quant.extra,
         )
 
     def _process_inline(self, module: NamedModule, device: torch.device = None):
@@ -396,6 +397,17 @@ class QuantizerProcessor(LoopProcessor):
         with self.lock:
             self.tasks[module.name].free()
 
+    def _preserve_pseudo_weight_for_replay(self, weight_quant_extra=None) -> bool:
+        """Keep dequantized pseudo weights on nn.Linear modules until ParoQuant export."""
+        extra = weight_quant_extra or {}
+        if extra.get("paroquant"):
+            return True
+        export_payload = getattr(self.qcfg, "weight_export", None)
+        if not export_payload:
+            return False
+        export_format = str(export_payload.get("format", "")).strip().lower()
+        return export_format in {"paroquant", "paro"}
+
     def _finalize_module_quant(
         self,
         module: NamedModule,
@@ -410,6 +422,7 @@ class QuantizerProcessor(LoopProcessor):
         nsamples,
         workspace_summary=None,
         workspace_totals=None,
+        weight_quant_extra=None,
     ):
         module.stream_state_payload_to_cpu(
             {
@@ -472,13 +485,14 @@ class QuantizerProcessor(LoopProcessor):
 
         self.log_new_row(stat)
 
-        if self.calculate_w_wq_diff:
+        if self.calculate_w_wq_diff and not self._preserve_pseudo_weight_for_replay(weight_quant_extra):
             w_wq_diff = module.weight.data.to(dtype=torch.float32) - wq.to(dtype=torch.float32)
             with self.lock:
                 module.state.update({"w_wq_diff": w_wq_diff})
                 module.state.update({"wq": wq})
 
-        module.weight.data = wq
+        if not self._preserve_pseudo_weight_for_replay(weight_quant_extra):
+            module.weight.data = wq
 
     def submodule_finalize(self, module: NamedModule, model: BaseQModel, **kwargs):
         export_payload = getattr(self.qcfg, "weight_export", None)

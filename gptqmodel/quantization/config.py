@@ -2850,6 +2850,7 @@ class BaseQuantizeConfig(metaclass=QuantizeConfigMeta):
             "opt_channel_scale_clamp_min": "opt_channel_scale_clamp_min",
             "opt_channel_scale_clamp_max": "opt_channel_scale_clamp_max",
             "scale_search_chunked_activations": "scale_search_chunked_activations",
+            "krot": "krot",
         }
         if isinstance(meta_payload, dict):
             for normalized_key, meta_key in meta_field_map.items():
@@ -3010,7 +3011,28 @@ class BaseQuantizeConfig(metaclass=QuantizeConfigMeta):
     def requires_calibration_dataset(self) -> bool:
         return not self.uses_weight_only_lifecycle()
 
+    def _resolve_paroquant_krot(self) -> Optional[int]:
+        krot = getattr(self, "krot", None)
+        if krot is not None:
+            return int(krot)
+        if self.meta and self.meta.get("krot") is not None:
+            return int(self.meta["krot"])
+        prepare = getattr(self, "weight_prepare", None) or []
+        for step in prepare:
+            method = getattr(step, "method", None)
+            if method in {"paroquant", "paro"}:
+                options = getattr(step, "options", {}) or {}
+                if "krot" in options:
+                    return int(options["krot"])
+        return None
+
     def quant_linear_init_kwargs(self) -> Dict[str, Any]:
+        export_method = self.export_quant_method()
+        format_code = resolve_quant_format(self.format, self.method)
+        if export_method == METHOD.PARO or format_code == FORMAT.PAROQUANT:
+            krot = self._resolve_paroquant_krot()
+            if krot is not None:
+                return {"krot": krot}
         return {}
 
 
@@ -3217,6 +3239,11 @@ class GPTQConfig(PreProcessorConfig):
     def _update_output_payload(self, out: Dict[str, Any]) -> None:
         out["sym"] = self.sym
         out[FORMAT_FIELD_CODE] = self.format
+        krot = self._resolve_paroquant_krot()
+        if krot is not None and (
+            self.method == METHOD.PARO or resolve_quant_format(self.format, self.method) == FORMAT.PAROQUANT
+        ):
+            out["krot"] = krot
 
 
 @dataclass

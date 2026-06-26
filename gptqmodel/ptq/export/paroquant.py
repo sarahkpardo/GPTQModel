@@ -50,11 +50,14 @@ class ParoQuantExport:
         pairs = payload["pairs"].clone()
         theta = payload["theta"].clone()
         channel_scales = payload["channel_scales"].clone()
+        krot = int(pairs.shape[0])
 
         submodule.weight.data = move_to(pack_weight, device=submodule.weight.device)
         qcfg = model.quantize_config
         format_code = resolve_quant_format(qcfg.format, qcfg.method)
         layers = find_modules(model.model)
+        init_kwargs = dict(qcfg.quant_linear_init_kwargs())
+        init_kwargs["krot"] = krot
         with parent_module_lock(submodule.full_name):
             create_quant_module(
                 name=submodule.full_name,
@@ -71,7 +74,7 @@ class ParoQuantExport:
                 pack_dtype=qcfg.pack_dtype,
                 format=format_code,
                 register_buffers=False,
-                init_kwargs=qcfg.quant_linear_init_kwargs(),
+                init_kwargs=init_kwargs,
             )
 
         qmodules = {
@@ -105,3 +108,6 @@ class ParoQuantExport:
         qmodule.post_init()
         model.quantize_config.method = METHOD.PARO
         model.quantize_config.format = FORMAT.PAROQUANT
+        model.quantize_config.meta_set("krot", krot)
+        if hasattr(model.quantize_config, "krot"):
+            model.quantize_config.krot = krot

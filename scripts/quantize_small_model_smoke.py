@@ -110,7 +110,7 @@ def _build_quantize_config(
     return QuantizeConfig(**kwargs)
 
 
-def _build_tiny_qwen3_moe_fixture(model_dir: Path) -> str:
+def _build_tiny_qwen3_moe_fixture(model_dir: Path, *, moe_intermediate_size: int = 32) -> str:
     """Build and save a tiny Qwen3 MoE checkpoint; return the model directory path."""
     from tokenizers import Tokenizer
     from tokenizers.models import WordLevel
@@ -124,7 +124,7 @@ def _build_tiny_qwen3_moe_fixture(model_dir: Path) -> str:
         num_hidden_layers=1,
         hidden_size=64,
         intermediate_size=128,
-        moe_intermediate_size=32,
+        moe_intermediate_size=moe_intermediate_size,
         num_attention_heads=4,
         num_key_value_heads=4,
         num_experts=4,
@@ -160,9 +160,13 @@ def _resolve_model_source(
     model_id: str,
     model_fixture: ModelFixture,
     work_dir: Path,
+    moe_intermediate_size: int = 32,
 ) -> str:
     if model_fixture == "tiny-qwen3-moe":
-        return _build_tiny_qwen3_moe_fixture(work_dir / "tiny-qwen3-moe")
+        return _build_tiny_qwen3_moe_fixture(
+            work_dir / "tiny-qwen3-moe",
+            moe_intermediate_size=moe_intermediate_size,
+        )
     return model_id
 
 
@@ -207,10 +211,12 @@ def _run_pipeline_smoke(
     elif export_mode is None and qcfg.weight_export is not None:
         export_mode = str(qcfg.weight_export.get("format", "gptq"))
     backend = _resolve_backend(device, weight_export=export_mode if export_mode in {"gptq", "paroquant"} else None)
+    moe_intermediate_size = 64 if export_mode == "paroquant" else 32
     model_source = _resolve_model_source(
         model_id=model_id,
         model_fixture=model_fixture,
         work_dir=work_dir,
+        moe_intermediate_size=moe_intermediate_size,
     )
 
     print(f"Loading {model_source!r} (pipeline={pipeline}, fixture={model_fixture}, factorization=cholesky)...")
