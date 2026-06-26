@@ -41,7 +41,11 @@ _require_runtime_deps()
 import torch  # noqa: E402
 
 from gptqmodel import BACKEND, GPTQModel, QuantizeConfig  # noqa: E402
-from gptqmodel.utils.moe_benchmark import configure_moe_quantize_config, is_moe_gptq_model  # noqa: E402
+from gptqmodel.utils.moe_benchmark import (  # noqa: E402
+    configure_moe_quantize_config,
+    is_moe_gptq_model,
+    moe_quantize_load_kwargs,
+)
 from gptqmodel.utils.wikitext_benchmark import (  # noqa: E402
     compute_wikitext_perplexity,
     load_wikitext_calibration,
@@ -57,6 +61,7 @@ def _build_quantize_config(
     bits: int,
     group_size: int,
     device: str,
+    extra_kwargs: dict[str, object] | None = None,
 ) -> QuantizeConfig:
     kwargs = dict(
         bits=bits,
@@ -71,6 +76,8 @@ def _build_quantize_config(
         weight_quantize={"method": "gptq"},
         weight_export={"format": "gptq"},
     )
+    if extra_kwargs:
+        kwargs.update(extra_kwargs)
     if weight_prepare == "random_orthogonal":
         kwargs["weight_prepare"] = [
             {
@@ -111,20 +118,27 @@ def _run_method(
     eval_seq_len: int,
     eval_n_tokens: int,
     work_dir: Path,
+    trust_remote_code: bool,
 ) -> dict[str, object]:
+    moe_load_kwargs = moe_quantize_load_kwargs(model_id, trust_remote_code=trust_remote_code)
     qcfg = _build_quantize_config(
         weight_prepare=weight_prepare,
         bits=bits,
         group_size=group_size,
         device=device,
+        extra_kwargs=moe_load_kwargs,
     )
     backend = _resolve_backend(device)
     load_kwargs = {"quantize_config": qcfg}
     quantize_backend = BACKEND.TORCH if device.startswith("cuda") else backend
     if quantize_backend is not None:
         load_kwargs["backend"] = quantize_backend
+    if trust_remote_code:
+        load_kwargs["trust_remote_code"] = True
 
     print(f"\n--- Quantizing ({weight_prepare} + gptq) ---")
+    if moe_load_kwargs:
+        print("MoE: disabling offload_to_disk for eager expert module layout.")
     model = GPTQModel.load(model_id, **load_kwargs)
     configure_moe_quantize_config(model, model.quantize_config)
     if is_moe_gptq_model(model):
@@ -223,6 +237,11 @@ def main() -> int:
         default=None,
         help="Directory for quantized checkpoints (default: temp dir).",
     )
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Pass trust_remote_code=True when resolving/loading the model.",
+    )
     args = parser.parse_args()
 
     methods: list[WeightPrepareMode] = []
@@ -240,6 +259,8 @@ def main() -> int:
     load_kwargs = {}
     if backend is not None:
         load_kwargs["backend"] = backend
+    if args.trust_remote_code:
+        load_kwargs["trust_remote_code"] = True
     baseline_model = GPTQModel.load(args.model_id, **load_kwargs)
     calibration = load_wikitext_calibration(
         baseline_model.tokenizer,
@@ -296,6 +317,7 @@ def main() -> int:
                 eval_seq_len=args.eval_seq_len,
                 eval_n_tokens=args.eval_n_tokens,
                 work_dir=work_dir,
+                trust_remote_code=args.trust_remote_code,
             )
             results.append(row)
             ppl = row["perplexity"]

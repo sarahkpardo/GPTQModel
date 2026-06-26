@@ -18,7 +18,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from gptqmodel import BACKEND, GPTQModel, QuantizeConfig  # noqa: E402
-from gptqmodel.utils.moe_benchmark import configure_moe_quantize_config  # noqa: E402
+from gptqmodel.utils.moe_benchmark import configure_moe_quantize_config, moe_quantize_load_kwargs  # noqa: E402
 from gptqmodel.utils.wikitext_benchmark import (  # noqa: E402
     compute_wikitext_perplexity,
     load_wikitext_calibration,
@@ -45,7 +45,7 @@ def _require_datasets():
     pytest.importorskip("datasets")
 
 
-def _build_quantize_config(*, weight_prepare: str, group_size: int = 128) -> QuantizeConfig:
+def _build_quantize_config(*, weight_prepare: str, group_size: int = 128, model_id: str) -> QuantizeConfig:
     kwargs = dict(
         bits=4,
         group_size=group_size,
@@ -59,6 +59,7 @@ def _build_quantize_config(*, weight_prepare: str, group_size: int = 128) -> Qua
         weight_quantize={"method": "gptq"},
         weight_export={"format": "gptq"},
     )
+    kwargs.update(moe_quantize_load_kwargs(model_id))
     if weight_prepare == "random_orthogonal":
         kwargs["weight_prepare"] = [
             {
@@ -85,7 +86,7 @@ def test_wikitext_quantize_reload_perplexity(tmp_path: Path, weight_prepare: str
     _require_datasets()
     model_id = _require_benchmark_model_id()
 
-    qcfg = _build_quantize_config(weight_prepare=weight_prepare)
+    qcfg = _build_quantize_config(weight_prepare=weight_prepare, model_id=model_id)
     model = GPTQModel.load(model_id, quantize_config=qcfg, backend=BACKEND.TORCH)
     configure_moe_quantize_config(model, model.quantize_config)
     calibration = load_wikitext_calibration(
