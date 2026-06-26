@@ -1197,11 +1197,11 @@ class HessianConfig:
         metadata={"help": "Stage Hessian chunks in a lower precision dtype when supported"},
     )
     factorization: str = field(
-        default="qr",
+        default="cholesky",
         metadata={
             "help": "Hessian factorization for GPTQ error propagation: "
-            "'qr' (Householder QR of activations, numerically stable) or "
-            "'cholesky' (classic Cholesky of H and H^{-1})"
+            "'cholesky' (classic Cholesky of H and H^{-1}, default) or "
+            "'qr' (Householder QR of activations, opt-in numerical variant)"
         },
     )
     row_buffer_max_rows: Optional[int] = field(

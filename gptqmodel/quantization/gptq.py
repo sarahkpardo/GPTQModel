@@ -339,7 +339,7 @@ class GPTQ:
         return tensor.narrow(tensor.dim() - 1, 0, trim).contiguous()
 
     def _uses_qr_factorization(self) -> bool:
-        return getattr(self.qcfg.hessian, "factorization", "qr") == "qr"
+        return getattr(self.qcfg.hessian, "factorization", "cholesky") == "qr"
 
     def _update_qr_from_matrix(self, matrix: torch.Tensor, device: torch.device) -> None:
         rows = matrix.shape[0]

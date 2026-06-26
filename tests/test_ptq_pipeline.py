@@ -42,14 +42,16 @@ def test_statistics_collector_row_buffer_is_bounded():
 
 def test_merge_qr_factors_via_collector_devices():
     hessian = HessianConfig(factorization="qr")
+    left_batch = torch.randn(10, 5)
+    right_batch = torch.randn(7, 5)
     left = StatisticsCollector(columns=5, hessian=hessian)
     right = StatisticsCollector(columns=5, hessian=hessian)
-    left.add_batch(torch.randn(10, 5))
-    right.add_batch(torch.randn(7, 5))
+    left.add_batch(left_batch)
+    right.add_batch(right_batch)
     _, r_left = left.finalize()
     _, r_right = right.finalize()
     merged = merge_qr_factors(r_left, r_right)
-    joint = torch.cat([torch.randn(10, 5), torch.randn(7, 5)], dim=0)
+    joint = torch.cat([left_batch, right_batch], dim=0)
     _, expected = torch.linalg.qr(joint.to(torch.float32), mode="reduced")
     assert torch.allclose(merged.T @ merged, expected.T @ expected, atol=1e-3, rtol=1e-3)
 

@@ -66,7 +66,7 @@ class StatisticsCollector:
         self._row_buffer_rows = 0
 
     def _uses_qr_factorization(self) -> bool:
-        return getattr(self.hessian, "factorization", "qr") == "qr"
+        return getattr(self.hessian, "factorization", "cholesky") == "qr"
 
     def preferred_staging_dtype(self, input_dtype: torch.dtype, device: torch.device) -> torch.dtype:
         staging_dtype = self.hessian.staging_dtype
