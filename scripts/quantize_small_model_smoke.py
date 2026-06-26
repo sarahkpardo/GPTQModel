@@ -10,7 +10,8 @@ Usage:
     python scripts/quantize_small_model_smoke.py
     python scripts/quantize_small_model_smoke.py --model-id gpt2 --pipeline ptq --device cpu
     python scripts/quantize_small_model_smoke.py --model-id gpt2 --compare --device cpu
-    python scripts/quantize_small_model_smoke.py --model-fixture tiny-qwen3-moe --device cpu
+    python scripts/quantize_small_model_smoke.py --model-id gpt2 --pipeline ptq --weight-prepare random_orthogonal --weight-quantize gptq --device cpu --check-parity
+    python scripts/quantize_small_model_smoke.py --model-fixture tiny-qwen3-moe --device cpu --pipeline ptq --weight-prepare random_orthogonal --weight-quantize gptq --check-parity
 """
 
 from __future__ import annotations

@@ -103,9 +103,16 @@ def _inference_from_buffers(module: nn.Module) -> InferenceTransformData | None:
 
 def _checkpoint_weight_files(checkpoint_path: str) -> list[str]:
     path = Path(checkpoint_path)
+    if path.name.endswith(".safetensors.index.json"):
+        import json
+
+        with path.open("r", encoding="utf-8") as handle:
+            index = json.load(handle)
+        base = path.parent
+        shard_names = sorted(set(index.get("weight_map", {}).values()))
+        return [str(base / shard_name) for shard_name in shard_names if shard_name]
     if path.is_dir():
-        files = sorted(path.glob("*.safetensors"))
-        return [str(file_path) for file_path in files if "model" in file_path.name]
+        return [str(file_path) for file_path in sorted(path.glob("*.safetensors"))]
     return [str(path)]
 
 

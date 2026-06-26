@@ -161,6 +161,8 @@ def test_random_orthogonal_pipeline_configs_complete():
     assert losses[("random_orthogonal", "gptq")] > 0.0
 
 
+@pytest.mark.colab
+@pytest.mark.slow
 def test_tiny_qwen3_moe_random_orthogonal_gptq_smoke(tmp_path: Path):
     model_dir = tmp_path / "native"
     quantized_dir = tmp_path / "quantized"

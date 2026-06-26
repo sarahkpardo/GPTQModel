@@ -26,10 +26,7 @@ from gptqmodel.ptq.context import ModuleCalibContext
 from gptqmodel.ptq.inference_data import InferenceTransformData
 from gptqmodel.ptq.inference_hooks import rehydrate_ptq_inference_hooks
 from gptqmodel.ptq.solvers.hessian import compute_hessian_inverse
-from gptqmodel.ptq.transforms.block_dense import (
-    apply_block_transform_to_activation,
-    apply_block_transform_to_weight,
-)
+from gptqmodel.ptq.transforms.block_dense import apply_block_transform_to_activation
 from gptqmodel.ptq.transforms.random_orthogonal import RandomOrthogonalTransform
 from gptqmodel.ptq.transforms.registry import build_transform_backend
 from gptqmodel.quantization.config import ExpertsRoutingOverride, HessianConfig, MoEConfig
@@ -232,6 +229,52 @@ def _assert_hooks_present(modules: dict[str, nn.Module]) -> list[str]:
     return hooked
 
 
+def test_hessian_full_congruence_preserves_pd():
+    backend, state, _ = _fit_state(in_features=64, block_size=32, seed=7)
+    torch.manual_seed(0)
+    h = torch.randn(64, 64)
+    h = h @ h.T + 0.05 * torch.eye(64)
+    h_prime = backend.transform_hessian(h.clone(), state)
+    evals = torch.linalg.eigvalsh(h_prime)
+    assert evals.min().item() >= -1e-4
+
+
+def test_load_ptq_inference_buffers_from_safetensors(tmp_path: Path):
+    from safetensors.torch import save_file
+
+    linear = nn.Linear(64, 32, bias=False)
+    inference = InferenceTransformData(
+        transform_type="dense",
+        T_X_matrices=torch.randn(32, 32, 2),
+        block_size=32,
+        precision=torch.float16,
+        extra={"pad": 0},
+    )
+    from gptqmodel.ptq.inference_hooks import (
+        load_ptq_inference_buffers_from_checkpoint,
+        persist_ptq_inference_buffers,
+    )
+
+    persist_ptq_inference_buffers(linear, inference, method="random_orthogonal", pad=0)
+    prefix = "layer0"
+    save_file(
+        {
+            f"{prefix}.ptq_t_x_matrices": linear.ptq_t_x_matrices,
+            f"{prefix}.ptq_t_x_block_size": linear.ptq_t_x_block_size,
+            f"{prefix}.ptq_t_x_pad": linear.ptq_t_x_pad,
+            f"{prefix}.ptq_transform_method_bytes": linear.ptq_transform_method_bytes,
+        },
+        str(tmp_path / "model.safetensors"),
+    )
+    target = nn.Module()
+    target.add_module("layer0", nn.Linear(64, 32, bias=False))
+    loaded = load_ptq_inference_buffers_from_checkpoint(target, str(tmp_path))
+    assert loaded == 1
+    assert target.layer0.ptq_t_x_matrices.shape == (32, 32, 2)
+
+
+@pytest.mark.colab
+@pytest.mark.slow
 def test_tiny_moe_random_orthogonal_pre_reload_hooks(tmp_path: Path):
     model_dir = tmp_path / "native"
     quantized_dir = tmp_path / "quantized"
@@ -248,6 +291,8 @@ def test_tiny_moe_random_orthogonal_pre_reload_hooks(tmp_path: Path):
     model.save(quantized_dir)
 
 
+@pytest.mark.colab
+@pytest.mark.slow
 def test_tiny_moe_random_orthogonal_post_reload(tmp_path: Path):
     model_dir = tmp_path / "native"
     quantized_dir = tmp_path / "quantized"
