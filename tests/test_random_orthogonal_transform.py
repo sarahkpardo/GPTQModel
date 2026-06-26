@@ -75,6 +75,31 @@ def test_weight_activation_preserve_matmul():
     assert torch.allclose(transformed, baseline, atol=1e-5, rtol=1e-4)
 
 
+def test_weight_activation_preserve_matmul_conv1d_layout():
+    backend = _make_backend(block_size=4, seed=19)
+    weight = torch.randn(8, 4)
+    ctx = ModuleCalibContext(module_name="attn.c_attn", columns=8, rows=4)
+    state = backend.fit(
+        weight=weight,
+        bias=None,
+        ctx=ctx,
+        mode="standalone",
+        device=torch.device("cpu"),
+    )
+    assert state.payload["weight_layout"] == "conv1d"
+    x = torch.randn(16, 8)
+    baked = backend.apply_to_weights(weight, state, device=torch.device("cpu"))
+    x_tx = apply_block_transform_to_activation(
+        x,
+        torch.stack([block.T for block in state.payload["T_W_blocks"]], dim=2).float(),
+        block_size=int(state.payload["group_size"]),
+        pad=int(state.payload["pad"]),
+    )
+    baseline = x @ weight
+    transformed = x_tx @ baked
+    assert torch.allclose(transformed, baseline, atol=1e-5, rtol=1e-4)
+
+
 def test_hessian_congruence_preserves_spectrum():
     backend, state, _ = _fit_state(in_features=8, block_size=4, seed=3)
     torch.manual_seed(0)

@@ -59,11 +59,13 @@ class GptqWeightOptimizer:
         inference_transform = None
         if transform is not None:
             inference_transform = transform.inference
-            if inference_transform is None and not transform.bake_weights:
-                from ..transforms.registry import build_transform_backend
+            if inference_transform is None:
                 from ..config import TransformPrepareConfig
+                from ..transforms.registry import build_transform_backend
 
-                backend = build_transform_backend(TransformPrepareConfig(method=transform.method))
+                backend = build_transform_backend(
+                    TransformPrepareConfig(method=transform.method)
+                )
                 inference_transform = backend.get_inference_data(transform)
 
         return WeightQuantState(

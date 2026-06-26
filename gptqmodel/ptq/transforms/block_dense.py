@@ -1,10 +1,17 @@
 # SPDX-FileCopyrightText: 2026 ModelCloud.ai
 # SPDX-License-Identifier: Apache-2.0
-"""Block-diagonal dense transforms for nn.Linear (out, in) weight layout.
+"""Block-diagonal dense transforms on the input feature axis.
+
+Weight layouts:
+
+- ``linear``: ``nn.Linear`` weight ``(out_features, in_features)``
+- ``conv1d``: ``transformers.Conv1D`` weight ``(in_features, out_features)``
 
 Conventions (input-axis blocks of size ``G``):
 
-- Offline weight transform with ``T_W = Q``: ``W[:, sl] = W[:, sl] @ Q.T``
+- Offline weight transform with ``T_W = Q``:
+  - linear: ``W[:, sl] = W[:, sl] @ Q.T``
+  - conv1d: ``W[sl, :] = Q @ W[sl, :]``
 - Online activation transform with stored ``T_X = Q.T`` (shape ``(G, G, C)``):
   ``x[:, sl] = x[:, sl] @ T_X[:, :, i]``  (equivalently ``x @ Q.T`` per block)
 - Hessian congruence (orthogonal ``Q``): ``H'[sl, sl] = Q @ H[sl, sl] @ Q.T``
@@ -95,36 +102,75 @@ def _resolve_blocks(
     return [block.to(device=device, dtype=dtype) for block in t_w_blocks]
 
 
+def resolve_weight_layout(weight: torch.Tensor, input_columns: int) -> str:
+    """Return ``linear`` or ``conv1d`` based on which axis matches calibration columns."""
+    if input_columns <= 0:
+        raise ValueError(f"input_columns must be positive, got {input_columns}.")
+    if weight.shape[1] == input_columns:
+        return "linear"
+    if weight.shape[0] == input_columns:
+        return "conv1d"
+    raise ValueError(
+        f"Weight shape {tuple(weight.shape)} is incompatible with input_columns={input_columns}."
+    )
+
+
 def apply_block_transform_to_weight(
     weight: torch.Tensor,
     t_w_blocks: Sequence[torch.Tensor],
     *,
     block_size: int,
     pad: int,
+    input_columns: int | None = None,
+    weight_layout: str | None = None,
 ) -> torch.Tensor:
-    """Apply offline ``T_W`` to ``weight`` shaped ``(out_features, in_features)``."""
-    out_features, in_features = weight.shape
-    padded, _, num_blocks = pad_columns(in_features, block_size)
-    if pad > 0:
-        weight_work = torch.cat(
-            [
-                weight,
-                torch.zeros(out_features, pad, device=weight.device, dtype=weight.dtype),
-            ],
-            dim=1,
-        )
-    else:
-        weight_work = weight
-
-    result = weight_work.clone()
+    """Apply offline ``T_W`` along the input feature axis."""
+    columns = int(input_columns if input_columns is not None else weight.shape[1])
+    layout = weight_layout or resolve_weight_layout(weight, columns)
+    padded, _, num_blocks = pad_columns(columns, block_size)
     device = weight.device
     dtype = weight.dtype
     blocks = _resolve_blocks(t_w_blocks, device, dtype)
-    for block_idx in range(num_blocks):
-        sl = slice(block_idx * block_size, (block_idx + 1) * block_size)
-        q = blocks[block_idx]
-        result[:, sl] = result[:, sl] @ q.T
-    return result[:, :in_features]
+
+    if layout == "linear":
+        out_features, in_features = weight.shape
+        if pad > 0:
+            weight_work = torch.cat(
+                [
+                    weight,
+                    torch.zeros(out_features, pad, device=device, dtype=dtype),
+                ],
+                dim=1,
+            )
+        else:
+            weight_work = weight
+        result = weight_work.clone()
+        for block_idx in range(num_blocks):
+            sl = slice(block_idx * block_size, (block_idx + 1) * block_size)
+            q = blocks[block_idx]
+            result[:, sl] = result[:, sl] @ q.T
+        return result[:, :in_features]
+
+    if layout == "conv1d":
+        in_features, out_features = weight.shape
+        if pad > 0:
+            weight_work = torch.cat(
+                [
+                    weight,
+                    torch.zeros(pad, out_features, device=device, dtype=dtype),
+                ],
+                dim=0,
+            )
+        else:
+            weight_work = weight
+        result = weight_work.clone()
+        for block_idx in range(num_blocks):
+            sl = slice(block_idx * block_size, (block_idx + 1) * block_size)
+            q = blocks[block_idx]
+            result[sl, :] = q @ result[sl, :]
+        return result[:in_features, :]
+
+    raise ValueError(f"Unsupported weight_layout `{layout}`.")
 
 
 def apply_block_transform_to_hessian(

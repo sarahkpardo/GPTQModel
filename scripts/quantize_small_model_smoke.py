@@ -97,6 +97,8 @@ def _build_quantize_config(
             }
         ]
         kwargs["weight_export"] = {"format": "gptq"}
+        if pipeline == "legacy":
+            kwargs.setdefault("weight_quantize", {"method": "gptq"})
     if weight_prepare == "paroquant":
         kwargs["weight_prepare"] = [
             {
@@ -325,13 +327,12 @@ def main() -> int:
     args = parser.parse_args()
     if args.model_fixture == "tiny-qwen3-moe" and args.group_size == 128:
         args.group_size = 32
-    if args.pipeline == "ptq-paroquant-moe":
-        if args.model_fixture != "tiny-qwen3-moe":
-            print("Note: ptq-paroquant-moe preset uses tiny-qwen3-moe fixture.", file=sys.stderr)
-            args.model_fixture = "tiny-qwen3-moe"
-        if args.device == "cpu":
-            print("Note: ptq-paroquant-moe preset requires CUDA; switching device to cuda.", file=sys.stderr)
-            args.device = "cuda"
+    if args.weight_prepare == "random_orthogonal" and args.pipeline == "legacy":
+        print(
+            "Note: random_orthogonal requires PTQ weight_prepare; using pipeline=ptq.",
+            file=sys.stderr,
+        )
+        args.pipeline = "ptq"
 
     if args.compare and args.pipeline != "legacy":
         print("Note: --compare runs both legacy and ptq; ignoring --pipeline.", file=sys.stderr)

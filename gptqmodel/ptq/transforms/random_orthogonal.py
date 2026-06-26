@@ -18,16 +18,17 @@ from .block_dense import (
     build_inference_transform_data,
     generate_random_orthogonal_blocks,
     pad_columns,
+    resolve_weight_layout,
 )
 from .paroquant import module_seed_from_options
 
 
-def _resolve_block_size(options: dict, weight: torch.Tensor) -> int:
+def _resolve_block_size(options: dict, input_columns: int) -> int:
     block_size = int(options.get("block_size", options.get("group_size", 128)))
     if block_size <= 0:
         raise ValueError(f"block_size/group_size must be positive, got {block_size}.")
-    if weight.shape[1] % block_size != 0 and "allow_pad" not in options:
-        padded, pad, _ = pad_columns(weight.shape[1], block_size)
+    if input_columns % block_size != 0:
+        padded, pad, _ = pad_columns(input_columns, block_size)
         if pad > 0:
             options.setdefault("allow_pad", True)
             options["pad"] = pad
@@ -66,9 +67,15 @@ class RandomOrthogonalTransform:
     ) -> TransformState:
         del bias, mode
         options = dict(self.cfg.options)
-        block_size = _resolve_block_size(options, weight)
-        in_features = weight.shape[1]
-        padded, pad, num_blocks = pad_columns(in_features, block_size)
+        input_columns = int(ctx.columns)
+        if input_columns <= 0:
+            raise ValueError(
+                f"RandomOrthogonalTransform requires positive ctx.columns for `{ctx.module_name}`, "
+                f"observed {input_columns}."
+            )
+        weight_layout = resolve_weight_layout(weight, input_columns)
+        block_size = _resolve_block_size(options, input_columns)
+        padded, pad, num_blocks = pad_columns(input_columns, block_size)
         seed = module_seed_from_options(module_name=ctx.module_name, options=options)
         inference_dtype = _resolve_inference_dtype(options)
 
@@ -86,6 +93,8 @@ class RandomOrthogonalTransform:
             "seed": seed,
             "pad": pad,
             "padded_columns": padded,
+            "input_columns": input_columns,
+            "weight_layout": weight_layout,
             "T_W_blocks": t_w_blocks,
             "T_X_matrices": t_x_matrices,
             "inference_precision": "float16",
@@ -110,6 +119,8 @@ class RandomOrthogonalTransform:
             payload["T_W_blocks"],
             block_size=int(payload["group_size"]),
             pad=int(payload.get("pad", 0)),
+            input_columns=int(payload.get("input_columns", weight.shape[1])),
+            weight_layout=str(payload.get("weight_layout", "linear")),
         )
 
     def transform_hessian(self, H: torch.Tensor, state: TransformState) -> torch.Tensor:
