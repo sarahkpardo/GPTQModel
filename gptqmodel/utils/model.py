@@ -1304,9 +1304,6 @@ def gptqmodel_post_init(model, use_act_order: bool, quantize_config: QuantizeCon
     Initialize model-persistent backend scratch buffers after quantized weights are loaded.
     """
     maybe_convert_gptq_v1_to_v2_runtime(model, quantize_config)
-    synced = sync_quant_linear_runtime_devices(model)
-    if synced:
-        log.info(f"Format: Synced quant buffer devices for {synced} REQUIRES_FORMAT_V2 module(s).")
 
     fixed_bytes = {}
     model_uses_exllamav2 = False
@@ -1337,13 +1334,25 @@ def gptqmodel_post_init(model, use_act_order: bool, quantize_config: QuantizeCon
         # have persistent buffers, otherwise we will get OOM
         model.device_tensors = device_tensors
 
-    # The buffers need to have been initialized first before calling make_q4.
+    # Initialize unpack/compile while quant buffers may still be CPU-staged, then
+    # move REQUIRES_FORMAT_V2 modules onto their parent compute device.
     for _, submodule in model.named_modules():
         if isinstance(submodule, (ExllamaV2Linear, AwqExllamaV2Linear)):
             device = submodule.qweight.device
             submodule.post_init(scratch_space=model.device_tensors[device])
         elif isinstance(submodule, BaseQuantLinear):
             submodule.post_init()
+
+    synced = sync_quant_linear_runtime_devices(model)
+    if synced:
+        log.info(f"Format: Synced quant buffer devices for {synced} REQUIRES_FORMAT_V2 module(s).")
+        from ..nn_modules.qlinear.torch import TorchLinear
+
+        for module in model.modules():
+            if isinstance(module, TorchLinear):
+                module.clear_weight_cache()
+                if hasattr(module, "_stream_reset_cache"):
+                    module._stream_reset_cache()
 
     from ..ptq.inference_hooks import rehydrate_ptq_inference_hooks
 

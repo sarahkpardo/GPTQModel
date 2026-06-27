@@ -136,13 +136,7 @@ def _resolve_eval_device(device: str) -> torch.device:
 
 def _prepare_model_for_ppl_eval(model: GPTQModel, eval_device: torch.device) -> torch.device:
     """Move a freshly quantized model onto the eval device before PPL measurement."""
-    current = next(model.model.parameters()).device
-    if current != eval_device:
-        print(
-            f"PPL eval: moving in-memory model from {current} to {eval_device} "
-            "(quantize finalize leaves modules on CPU)."
-        )
-        model.to(eval_device)
+    model.to(eval_device)
     cleared = clear_torchlinear_inference_state(model.model)
     if cleared:
         print(f"PPL eval: cleared TorchLinear inference caches on {cleared} module(s).")
