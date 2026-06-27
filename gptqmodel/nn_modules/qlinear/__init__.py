@@ -714,6 +714,8 @@ class GPTQQuantLinear(PackedGroupedQuantLinear):
                 register_buffers_in_features=register_buffers_in_features,
                 register_buffers_out_features=register_buffers_out_features,
             )
+        elif not bias:
+            self.bias = None
 
     def _register_gptq_buffers(
         self,
@@ -960,6 +962,8 @@ class PackableQuantLinear(GPTQQuantLinear):
         self.register_buffer("scales", scales.to(dtype=t.float16))
         if linear.bias is not None:
             self.register_buffer("bias", linear.bias.detach().to("cpu", dtype=t.float16))
+        else:
+            self.bias = None
 
         # ---------- constants ----------
         bits = int(self.bits)  # 2,3,4,8

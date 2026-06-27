@@ -309,8 +309,9 @@ class TorchLinear(PackableQuantLinear):
         cached = self._maybe_get_cached_weights(x)
         if cached is not None:
             out = torch.matmul(x, cached).reshape(out_shape)
-            if self.bias is not None:
-                out.add_(self.bias)
+            bias = getattr(self, "bias", None)
+            if bias is not None:
+                out.add_(bias)
         elif self._should_use_streaming(x):
             out = self._forward_streaming(x, out_shape)
         else:
@@ -331,8 +332,8 @@ class TorchLinear(PackableQuantLinear):
             weights = weights.to(device=x.device, dtype=x.dtype)
         self._update_cached_weights(weights)
         out = torch.matmul(x, weights).reshape(out_shape)
-        if self.bias is not None:
-            bias = self.bias
+        bias = getattr(self, "bias", None)
+        if bias is not None:
             if bias.device != out.device or bias.dtype != out.dtype:
                 bias = bias.to(device=out.device, dtype=out.dtype)
             out.add_(bias)
@@ -395,8 +396,9 @@ class TorchLinear(PackableQuantLinear):
 
         out = out.reshape(out_shape)
 
-        if self.bias is not None:
-            out.add_(self.bias)
+        bias = getattr(self, "bias", None)
+        if bias is not None:
+            out.add_(bias)
 
         if self.adapter:
             out = self.adapter.apply(x=x, out=out)
