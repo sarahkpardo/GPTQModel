@@ -731,7 +731,11 @@ def run_layer_stage(
                         setattr(inner_module, "target_device", CPU)
 
                 if region_timer is not None:
-                    region_timer.flush()
+                    region_timer.flush(
+                        layer_index=layer_index,
+                        layer_label=str(layer_descriptor),
+                        render=False,
+                    )
 
                 processor.flush_layer_dashboard(layer_index, layer_label=str(layer_descriptor))
 

@@ -1622,6 +1622,7 @@ class ModuleLooper():
 
         if region_timer is not None:
             region_timer.flush()
+            region_timer.write_full_log_summary()
 
         self.gptq_model.model.config.use_cache = forward_pass_use_cache
 

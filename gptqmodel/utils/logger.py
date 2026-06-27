@@ -4,6 +4,7 @@
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
 
 import contextlib
+import json
 import logging
 import numbers
 import os
@@ -11,7 +12,11 @@ import sys
 import threading
 import time
 from collections import OrderedDict
-from typing import Any, Dict, Iterator, Optional, Sequence
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
+
+from .random_str import get_random_string
 
 import pcre
 from logbar import LogBar
@@ -257,6 +262,56 @@ class LayerQuantDashboard:
         return "" if value is None else str(value)
 
 
+REGION_TIMING_COLUMNS: tuple[str, ...] = (
+    "region",
+    "count",
+    "last_s",
+    "avg_s",
+    "total_s",
+    "pct",
+    "source",
+)
+
+_PROJECT_LOG_DIR = Path("logs")
+
+
+class RegionTimingDashboard:
+    """In-place terminal summary for cumulative region timing (top/nvidia-smi style)."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._lines_printed = 0
+
+    def close(self) -> None:
+        """Leave the terminal on a fresh line after the last in-place redraw."""
+        with self._lock:
+            if self._lines_printed > 0:
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                self._lines_printed = 0
+
+    def render(
+        self,
+        *,
+        title: str,
+        rows: Sequence[Sequence[str]],
+        headers: Optional[Sequence[str]] = None,
+    ) -> None:
+        if not rows:
+            return
+
+        column_headers = list(headers or REGION_TIMING_COLUMNS)
+        table = render_table(rows, headers=column_headers, tablefmt="grid")
+        output = f"{title}\n{table}\n"
+
+        with self._lock:
+            if self._lines_printed > 0:
+                sys.stdout.write(f"\033[{self._lines_printed}A\033[J")
+            sys.stdout.write(output)
+            sys.stdout.flush()
+            self._lines_printed = output.count("\n")
+
+
 def setup_logger():
     _configure_third_party_logging()
     return _AdaptiveLoggerProxy(LogBar.shared())
@@ -377,43 +432,75 @@ class QuantizationRegionTimer:
     def __init__(self, logger: Optional[LogBar] = None):
         self.logger = logger or setup_logger()
         self._lock = threading.Lock()
-        self._columns = None
-        self._header_printed = False
         self._region_labels: "OrderedDict[str, str]" = OrderedDict(self.DEFAULT_REGIONS)
         self._stats: "OrderedDict[str, Dict[str, float | int | str | None]]" = OrderedDict()
         self._pending_refresh = False
+        self._dashboard = RegionTimingDashboard() if layer_dashboard_enabled() else None
+        self._log_file: Optional[Path] = None
+        self._flush_count = 0
         self.reset()
+
+    @staticmethod
+    def _build_log_file_path(current_time: str) -> Path:
+        _PROJECT_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        return _PROJECT_LOG_DIR / f"region_timing_log_{get_random_string()}_time_{current_time}.log"
 
     def reset(self) -> None:
         """Reset accumulated timing data."""
         with self._lock:
+            if self._dashboard is not None:
+                self._dashboard.close()
             self._stats = OrderedDict(
                 (region, self._fresh_stat()) for region in self._region_labels.keys()
             )
-            self._header_printed = False
             self._pending_refresh = False
+            self._flush_count = 0
+            current_time = datetime.now().strftime("%m_%d_%Y_%Hh_%Mm_%Ss")
+            self._log_file = self._build_log_file_path(current_time)
 
     def _fresh_stat(self) -> Dict[str, float | int | None]:
         return {"total": 0.0, "count": 0, "last": 0.0, "source": None}
 
-    def _ensure_columns_locked(self) -> None:
-        if self._columns is not None:
-            return
-
-        column_specs = [
-            {"label": "region", "width": "fit"},
-            {"label": "count", "width": "fit"},
-            {"label": "last_s", "width": "fit"},
-            {"label": "avg_s", "width": "fit"},
-            {"label": "total_s", "width": "fit"},
-            {"label": "pct", "width": "fit"},
-            {"label": "source", "width": "fit"},
+    def _populated_regions_locked(
+        self,
+    ) -> List[Tuple[str, Dict[str, float | int | str | None]]]:
+        populated = [
+            (region, stat)
+            for region, stat in self._stats.items()
+            if stat.get("count", 0)
         ]
+        populated.sort(key=lambda item: float(item[1].get("total", 0.0)), reverse=True)
+        return populated
 
-        self._columns = self.logger.columns(cols=column_specs, padding=1)
-        self._columns.info.simulate(
-            "model_load", "1", "0.001", "0.001", "0.001", "100.0%", "layer.0"
-        )
+    def _rows_locked(
+        self,
+        populated: Sequence[Tuple[str, Dict[str, float | int | str | None]]],
+    ) -> Tuple[List[List[str]], float]:
+        overall_total = sum(float(stat.get("total", 0.0)) for _, stat in populated)
+        if overall_total <= 0:
+            overall_total = 0.0
+
+        rows: List[List[str]] = []
+        for region, stat in populated:
+            display_name = self._region_labels.get(region, region)
+            total = float(stat.get("total", 0.0))
+            count = int(stat.get("count", 0))
+            last = float(stat.get("last", 0.0))
+            avg = total / count if count else 0.0
+            pct = (total / overall_total * 100.0) if overall_total > 0 else 0.0
+            source = stat.get("source") or ""
+            rows.append(
+                [
+                    display_name,
+                    str(count),
+                    f"{last:.3f}",
+                    f"{avg:.3f}",
+                    f"{total:.3f}",
+                    f"{pct:.1f}%",
+                    str(source),
+                ]
+            )
+        return rows, overall_total
 
     def record(self, region: str, duration: float, *, source: Optional[str] = None) -> None:
         """Record a timing sample for a region and emit an updated summary."""
@@ -444,56 +531,125 @@ class QuantizationRegionTimer:
 
             self._pending_refresh = True
 
-    def flush(self) -> None:
-        """Emit the current summary if new measurements were recorded."""
+    def flush(
+        self,
+        *,
+        layer_index: Optional[int] = None,
+        layer_label: Optional[str] = None,
+        render: bool = True,
+    ) -> None:
+        """Refresh the in-place dashboard and append a JSON snapshot to the log file."""
         with self._lock:
             if not self._pending_refresh:
                 return
-            self._print_summary_locked()
+            self._emit_locked(
+                layer_index=layer_index,
+                layer_label=layer_label,
+                render=render,
+            )
             self._pending_refresh = False
 
-    def _print_summary_locked(self) -> None:
-        self._ensure_columns_locked()
-
-        # Filter out regions that have not been recorded yet.
-        populated = [
-            (region, stat)
-            for region, stat in self._stats.items()
-            if stat.get("count", 0)
-        ]
-
+    def _emit_locked(
+        self,
+        *,
+        layer_index: Optional[int] = None,
+        layer_label: Optional[str] = None,
+        render: bool = True,
+    ) -> None:
+        populated = self._populated_regions_locked()
         if not populated:
             return
 
-        overall_total = sum(float(stat.get("total", 0.0)) for _, stat in populated)
-        if overall_total <= 0:
-            overall_total = 0.0
+        rows, _ = self._rows_locked(populated)
+        headers = list(REGION_TIMING_COLUMNS)
 
-        # Sort by total descending so hotspots float to the top.
-        populated.sort(key=lambda item: float(item[1].get("total", 0.0)), reverse=True)
-
-        if not self._header_printed:
-            self._columns.info.header()
-            self._header_printed = True
-
-        for region, stat in populated:
-            display_name = self._region_labels.get(region, region)
-            total = float(stat.get("total", 0.0))
-            count = int(stat.get("count", 0))
-            last = float(stat.get("last", 0.0))
-            avg = total / count if count else 0.0
-            pct = (total / overall_total * 100.0) if overall_total > 0 else 0.0
-            source = stat.get("source") or ""
-
-            self._columns.info(
-                display_name,
-                str(count),
-                f"{last:.3f}",
-                f"{avg:.3f}",
-                f"{total:.3f}",
-                f"{pct:.1f}%",
-                source,
+        if render and self._dashboard is not None:
+            title_parts = ["Region timing"]
+            if layer_index is not None:
+                label = layer_label or str(layer_index)
+                title_parts.append(f"— Layer {layer_index} ({label})")
+            self._dashboard.render(
+                title=" ".join(title_parts),
+                rows=rows,
+                headers=headers,
             )
+
+        self._append_snapshot_locked(
+            layer_index=layer_index,
+            layer_label=layer_label,
+            populated=populated,
+        )
+
+    def _append_snapshot_locked(
+        self,
+        *,
+        layer_index: Optional[int],
+        layer_label: Optional[str],
+        populated: Sequence[Tuple[str, Dict[str, float | int | str | None]]],
+    ) -> None:
+        if self._log_file is None:
+            return
+
+        snapshot = {
+            "flush": self._flush_count,
+            "layer_index": layer_index,
+            "layer_label": layer_label,
+            "regions": {
+                region: {
+                    "total": float(stat.get("total", 0.0)),
+                    "count": int(stat.get("count", 0)),
+                    "last": float(stat.get("last", 0.0)),
+                    "source": stat.get("source"),
+                }
+                for region, stat in populated
+            },
+        }
+        self._flush_count += 1
+
+        with open(self._log_file, "a", encoding="utf-8") as handle:
+            json.dump(snapshot, handle, indent=2)
+            handle.write("\n")
+
+    def write_full_log_summary(self) -> Optional[str]:
+        """Write a human-readable summary table to disk and report its path once."""
+        with self._lock:
+            populated = self._populated_regions_locked()
+            if not populated:
+                if self._dashboard is not None:
+                    self._dashboard.close()
+                return None
+
+            rows, overall_total = self._rows_locked(populated)
+            log_file = self._log_file
+            flush_count = self._flush_count
+
+        if log_file is None:
+            return None
+
+        summary_path = log_file.with_suffix(".summary.log")
+        table_text = render_table(rows, headers=list(REGION_TIMING_COLUMNS), tablefmt="grid")
+
+        with open(summary_path, "w", encoding="utf-8") as handle:
+            handle.write("# Region timing summary\n")
+            handle.write(f"# JSON log: {log_file}\n")
+            handle.write(f"# Flushes: {flush_count}\n")
+            handle.write(f"# Total tracked time: {overall_total:.3f}s\n\n")
+            handle.write(table_text)
+            handle.write("\n")
+
+        if self._dashboard is not None:
+            self._dashboard.render(title="Region timing (final)", rows=rows)
+            self._dashboard.close()
+
+        self.logger.info(
+            f"Region timing log written to: {summary_path} (JSON snapshots: {log_file})"
+        )
+        return str(summary_path)
+
+    def close(self) -> None:
+        """Release any live terminal dashboard state."""
+        if self._dashboard is not None:
+            self._dashboard.close()
 
     @contextlib.contextmanager
     def measure(self, region: str, *, source: Optional[str] = None) -> Iterator[None]:

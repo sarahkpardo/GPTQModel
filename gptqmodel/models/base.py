@@ -1525,6 +1525,7 @@ class BaseQModel(nn.Module):
                     source=target,
                 )
                 timer.flush()
+                timer.write_full_log_summary()
 
     def _active_auto_module_decoder_config(self) -> Optional[AutoModuleDecoderConfig]:
         """Return the active auto-decoder preprocessor config, if any."""
