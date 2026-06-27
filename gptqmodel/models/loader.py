@@ -1207,6 +1207,8 @@ def ModelLoader(cls):
                 else:
                     raise
             _convert_model_with_defuser(cls, model, cleanup_original=True)
+            if hasattr(model, "tie_weights") and getattr(getattr(model, "config", None), "tie_word_embeddings", False):
+                model.tie_weights()
             model.checkpoint_file_name = model_save_name
             if native_gguf_qspec is not None:
                 gguf_tensor_key_mapping = _build_gguf_tensor_key_mapping(model, config)
@@ -1472,6 +1474,11 @@ def ModelLoader(cls):
         load_checkpoint_in_model = native_gguf_qspec is None
         # compat: runtime convert checkpoint gptq(v1) to gptq_v2 format
         if format_code in [FORMAT.GPTQ, FORMAT.GEMM, FORMAT.PAROQUANT]:
+            if format_code != FORMAT.EXL3:
+                from ..ptq.inference_hooks import load_ptq_inference_buffers_from_checkpoint
+
+                load_ptq_inference_buffers_from_checkpoint(model, model_save_name)
+
             load_checkpoint_in_model_then_tie_weights(
                 model,
                 dtype=dtype,
@@ -1567,6 +1574,10 @@ def ModelLoader(cls):
             BACKEND.GPTQ_BITBLAS,
             BACKEND.AWQ_BITBLAS,
         ]:
+            if format_code != FORMAT.EXL3:
+                from ..ptq.inference_hooks import load_ptq_inference_buffers_from_checkpoint
+
+                load_ptq_inference_buffers_from_checkpoint(model, model_save_name)
             load_checkpoint_in_model_then_tie_weights(
                 model,
                 dtype=dtype,
@@ -1615,10 +1626,7 @@ def ModelLoader(cls):
             model.seqlen = 4096
 
         if format_code != FORMAT.EXL3:
-            from ..ptq.inference_hooks import load_ptq_inference_buffers_from_checkpoint
-
-            load_ptq_inference_buffers_from_checkpoint(model, model_save_name)
-            # Any post-initialization that require device information, for example buffers initialization on device.
+            # PTQ buffers were registered before checkpoint load; post_init rehydrates hooks.
             model = gptqmodel_post_init(model, use_act_order=qcfg.desc_act, quantize_config=qcfg)
 
         model.eval()

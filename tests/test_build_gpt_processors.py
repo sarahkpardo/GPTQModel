@@ -21,7 +21,7 @@ def test_build_gpt_quantizer_processors_returns_sequential_ptq():
     args = {
         "tokenizer": None,
         "qcfg": qcfg,
-        "calibration": [],
+        "calibration": None,
         "prepare_dataset_func": None,
         "calibration_concat_size": None,
         "calibration_sort": None,

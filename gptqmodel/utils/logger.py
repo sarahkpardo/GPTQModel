@@ -4,6 +4,7 @@
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
 
 import contextlib
+import logging
 import numbers
 import os
 import sys
@@ -103,7 +104,45 @@ def live_renderables_suppressed() -> bool:
     return _suppress_live_renderables()
 
 
+_THIRD_PARTY_LOGGERS = (
+    "httpx",
+    "httpcore",
+    "urllib3",
+    "huggingface_hub",
+    "datasets",
+    "filelock",
+    "accelerate",
+)
+
+_THIRD_PARTY_LOGGING_CONFIGURED = False
+
+
+def _configure_third_party_logging() -> None:
+    """Suppress noisy HTTP/progress logs unless GPTQMODEL_VERBOSE is set."""
+    global _THIRD_PARTY_LOGGING_CONFIGURED
+    if _THIRD_PARTY_LOGGING_CONFIGURED:
+        return
+    _THIRD_PARTY_LOGGING_CONFIGURED = True
+
+    verbose = os.environ.get("GPTQMODEL_VERBOSE", "").strip().lower() in {"1", "true", "yes", "on"}
+    if verbose:
+        return
+
+    level = logging.WARNING
+    for name in _THIRD_PARTY_LOGGERS:
+        logging.getLogger(name).setLevel(level)
+
+    try:
+        from transformers.utils import logging as hf_logging
+
+        hf_logging.disable_progress_bar()
+        hf_logging.set_verbosity_error()
+    except Exception:
+        pass
+
+
 def setup_logger():
+    _configure_third_party_logging()
     return _AdaptiveLoggerProxy(LogBar.shared())
 
 

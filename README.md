@@ -19,6 +19,12 @@
     </a>
 </p>
 
+## Modular PTQ (fork)
+
+This checkout includes a **composable PTQ pipeline** (`weight_prepare` → `weight_quantize` → `weight_export`) with per-module `SequentialPTQProcessor` ordering. Standalone GPTQ and ParoQuant remain parity-compatible with pre-refactor behavior.
+
+See **[docs/PTQ_RESTRUCTURE.md](docs/PTQ_RESTRUCTURE.md)** for architecture, config recipes, and validation commands. Workspace overview: [../README.md](../README.md).
+
 ## Latest News
 
 * 05/25/2026 7.1.0-dev `main`: ✨ Added `hunyuan_v1_dense` and `hunyuan_v1_moe` model support

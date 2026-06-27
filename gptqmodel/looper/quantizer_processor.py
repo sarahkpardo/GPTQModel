@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 ModelCloud.ai
 # SPDX-License-Identifier: Apache-2.0
-"""Generic weight quantizer processor with inline or split PTQ capture modes."""
+"""Generic weight quantizer processor for split PTQ capture (SequentialPTQProcessor)."""
 
 from __future__ import annotations
 
@@ -14,8 +14,7 @@ from torch.nn import Module
 
 from ..looper.loop_processor import DTYPE_SIZE_COLUMN, ExecutionConfig, MODULE_FEATURE_COLUMN, LoopProcessor
 from ..looper.named_module import NamedModule
-from ..looper.statistics_processor import PTQ_CONTEXT_KEY
-from ..looper.transform_processor import PTQ_TRANSFORM_KEY
+from ..looper.ptq_keys import PTQ_CONTEXT_KEY, PTQ_TRANSFORM_KEY
 from ..models import BaseQModel
 from ..models._const import CPU
 from ..models.writer import (
@@ -32,19 +31,16 @@ from ..models.writer import (
 from ..ptq.calibration_coverage import expected_calibration_tokens
 from ..ptq.config import WeightQuantizeTargetConfig, resolve_weight_quantize_target
 from ..ptq.optimizers.registry import build_weight_optimizer, weight_optimizer_requires_calibration
-from ..quantization import FOEM, GPTAQ, GPTQ
 from ..quantization.config import FOEMConfig, GPTAQConfig, HessianConfig, METHOD, QuantizeConfig, resolve_quant_format
 from ..utils.device import get_device
 from ..utils.fallback import normalize_fallback
 from ..utils.logger import log_time_block, setup_logger
 from ..utils.model import create_quant_module, find_modules, pack_module
 from ..utils.module_locks import parent_module_lock
-from ..utils.torch import HAS_NPU
-
 log = setup_logger()
 lock = threading.Lock()
 
-CaptureMode = Literal["none", "inline"]
+CaptureMode = Literal["none"]
 
 
 def clone_gptq_config_for_module(
@@ -124,10 +120,14 @@ class QuantizerProcessor(LoopProcessor):
         calculate_w_wq_diff: bool = False,
         calibration_concat_separator: Optional[str] = None,
         weight_quantize: WeightQuantizeTargetConfig | None = None,
-        capture_mode: CaptureMode = "inline",
+        capture_mode: CaptureMode = "none",
     ):
+        if capture_mode != "none":
+            raise ValueError(
+                "QuantizerProcessor only supports capture_mode='none'; "
+                "use SequentialPTQProcessor for the production GPTQ pipeline."
+            )
         self.capture_mode = capture_mode
-        inline = capture_mode == "inline"
         target = weight_quantize or resolve_weight_quantize_target(qcfg)
         self.weight_quantize = target
 
@@ -141,24 +141,21 @@ class QuantizerProcessor(LoopProcessor):
             prepare_dataset_func=prepare_dataset_func,
             batch_size=batch_size,
             execution_config=ExecutionConfig(
-                require_fwd=require_fwd if inline else False,
+                require_fwd=False,
                 fwd_replay_after_process=True,
-                subset_forward_early_stop=inline,
+                subset_forward_early_stop=False,
             ),
         )
 
-        self.optimizer = None if inline else build_weight_optimizer(target, qcfg)
+        self.optimizer = build_weight_optimizer(target, qcfg)
         self.calculate_w_wq_diff = calculate_w_wq_diff
         self.avg_losses = []
         self.preserve_batch_keep_mask = True
         self._split_modules: Dict[str, bool] = {}
 
     def set_calibration_dataset(self, calibration_dataset):
-        if self.capture_mode == "none":
-            self.calibration_dataset = calibration_dataset
-            self.total_calibration_tokens = LoopProcessor._compute_total_tokens(calibration_dataset)
-            return
-        raise NotImplementedError("QuantizerProcessor's calibration_dataset cannot be modified")
+        self.calibration_dataset = calibration_dataset
+        self.total_calibration_tokens = LoopProcessor._compute_total_tokens(calibration_dataset)
 
     def preprocess(self, module: NamedModule, fallback=None, **kwargs):
         del kwargs
@@ -171,66 +168,18 @@ class QuantizerProcessor(LoopProcessor):
             return
 
         self.qcfg_dynamic = qcfg_clone
-
-        if self.capture_mode == "none":
-            self._split_modules[module.name] = True
-            return
-
-        if qcfg_clone.gptaq is not None:
-            tmp = GPTAQ(module=module, qcfg=qcfg_clone)
-        elif qcfg_clone.foem is not None:
-            tmp = FOEM(module=module, qcfg=qcfg_clone)
-        else:
-            tmp = GPTQ(module=module, qcfg=qcfg_clone)
-        tmp.fallback = None
-        tmp.expected_nsamples = expected_calibration_tokens(self)
-
-        tmp.quantizer.configure(perchannel=True)
-        self.tasks[module.name] = tmp
+        self._split_modules[module.name] = True
 
     def is_skipped(self, module: NamedModule) -> bool:
-        if self.capture_mode == "none":
-            return module.name not in self._split_modules
-        t = self.tasks.get(module.name, False)
-        return t is False
+        return module.name not in self._split_modules
 
     def pre_process_fwd_hook(self, name: str) -> Callable[[Module, Tuple[torch.Tensor, ...], torch.Tensor], None]:
-        if self.capture_mode == "none":
+        del name
 
-            def _noop(*_args, **_kwargs):
-                return None
+        def _noop(*_args, **_kwargs):
+            return None
 
-            return _noop
-
-        def tmp(module, inp: Tuple[torch.Tensor, ...], out: torch.Tensor):
-            g = self.tasks[name]  # noqa: F821
-            batch_idx = self.current_batch_index()
-            inp_tensor = inp[0]
-            keep_mask = getattr(getattr(self, "_mask_tls", None), "value", None)
-
-            if (
-                torch.is_tensor(inp_tensor)
-                and torch.is_tensor(keep_mask)
-                and inp_tensor.dim() >= 3
-                and keep_mask.ndim == 2
-                and keep_mask.shape[:2] == inp_tensor.shape[:2]
-            ):
-                out_tensor = out if torch.is_tensor(out) else None
-                for sample_index, sample_keep in enumerate(keep_mask):
-                    if not bool(sample_keep.any().item()):
-                        continue
-
-                    sample_inp = inp_tensor[sample_index : sample_index + 1, sample_keep, :].contiguous()
-                    if out_tensor is not None and out_tensor.dim() >= 3 and out_tensor.shape[:2] == inp_tensor.shape[:2]:
-                        sample_out = out_tensor[sample_index : sample_index + 1, sample_keep, :].contiguous()
-                    else:
-                        sample_out = out
-                    g.add_batch(sample_inp.data, sample_out.data, batch_index=batch_idx)  # noqa: F821
-            else:
-                g.add_batch(inp_tensor.data, out.data, batch_index=batch_idx)  # noqa: F821
-            del inp, out
-
-        return tmp
+        return _noop
 
     def process(
         self,
@@ -242,10 +191,7 @@ class QuantizerProcessor(LoopProcessor):
         subset_total: Optional[int] = None,
     ):
         del subset, previous_subset, subset_index, subset_total
-        if self.capture_mode == "none":
-            self._process_split(module, device=device)
-        else:
-            self._process_inline(module, device=device)
+        self._process_split(module, device=device)
 
     def _process_split(self, module: NamedModule, device: torch.device = None):
         base_title = f"Quantizing {module.name} in layer"
@@ -309,93 +255,6 @@ class QuantizerProcessor(LoopProcessor):
             nsamples=nsamples,
             weight_quant_extra=weight_quant.extra,
         )
-
-    def _process_inline(self, module: NamedModule, device: torch.device = None):
-        base_title = f"Quantizing {module.name} in layer"
-        self.draw_progress(base_title)
-
-        with self.lock:
-            g = self.tasks[module.name]
-
-        expected_device = getattr(module, "target_device", None)
-        if expected_device is None:
-            expected_device = getattr(module.module, "target_device", None)
-        if expected_device is None:
-            expected_device = get_device(module.module)
-
-        if expected_device is not None:
-            expected_device = torch.device(expected_device)
-
-            module_weight = getattr(module.module, "weight", None)
-            if module_weight is not None:
-                assert module_weight.device == expected_device, (
-                    f"Module '{module.full_name}' weight device {module_weight.device} does not match "
-                    f"assigned target device {expected_device}."
-                )
-                assert module_weight.data.device == expected_device, (
-                    f"Module '{module.full_name}' weight.data device {module_weight.data.device} does not match "
-                    f"assigned target device {expected_device}."
-                )
-
-            g_module = getattr(g, "module", None)
-            g_weight = getattr(g_module, "weight", None) if g_module is not None else None
-            if g_weight is not None:
-                assert g_weight.device == expected_device, (
-                    f"GPTQ task for module '{module.full_name}' expected device {expected_device}, "
-                    f"but found weight on {g_weight.device}."
-                )
-                assert g_weight.data.device == expected_device, (
-                    f"GPTQ task for module '{module.full_name}' weight.data on {g_weight.data.device} "
-                    f"does not match target device {expected_device}."
-                )
-
-            g_h = getattr(g, "H", None)
-            if g_h is not None:
-                assert torch.device(g_h.device) == expected_device, (
-                    f"GPTQ Hessian tensor for '{module.full_name}' lives on {g_h.device}, expected {expected_device}."
-                )
-
-            if expected_device.type == "cuda" and torch.cuda.is_available():
-                current_cuda_device = torch.device("cuda", torch.cuda.current_device())
-                assert current_cuda_device == expected_device, (
-                    f"CUDA thread context {current_cuda_device} does not match expected device {expected_device} "
-                    f"while processing '{module.full_name}'."
-                )
-            if expected_device.type == "npu" and HAS_NPU:
-                current_npu_device = torch.device("npu", torch.npu.current_device())
-                assert current_npu_device == expected_device, (
-                    f"NPU thread context {current_npu_device} does not match expected device {expected_device} "
-                    f"while processing '{module.full_name}'."
-                )
-
-        if g.nsamples <= 0:
-            raise ValueError(
-                f"GPTQ quantizer requires calibration samples for `{module.full_name}`, observed 0."
-            )
-
-        wq, q_scales, q_zeros, q_g_idx, duration, avg_loss, damp_percent, nsamples = g.quantize()
-
-        workspace_summary = getattr(g, "_borrow_workspace_last_summary", None)
-        workspace_totals = getattr(g, "_borrow_workspace_totals", None)
-
-        self._finalize_module_quant(
-            module,
-            wq=wq,
-            q_scales=q_scales,
-            q_zeros=q_zeros,
-            q_g_idx=q_g_idx,
-            duration=duration,
-            avg_loss=avg_loss,
-            damp_percent=damp_percent,
-            nsamples=nsamples,
-            workspace_summary=workspace_summary,
-            workspace_totals=workspace_totals,
-        )
-
-        g.log_workspace_stats(context="gptq_process")
-
-        with self.lock:
-            self.tasks[module.name].free()
 
     def _preserve_pseudo_weight_for_replay(self, weight_quant_extra=None) -> bool:
         """Keep dequantized pseudo weights on nn.Linear modules until ParoQuant export."""
@@ -673,11 +532,7 @@ class QuantizerProcessor(LoopProcessor):
 
     def verify_calibration_dataset(self, processor_index: int) -> bool:
         del processor_index
-        if self.capture_mode == "none":
-            return False
-        if self.calibration_dataset is None:
-            raise ValueError("QuantizerProcessor's calibration_dataset must be provided.")
-        return True
+        return False
 
     def name(self) -> str:
         qcfg = self.qcfg_dynamic if self.qcfg_dynamic is not None else self.qcfg
@@ -694,23 +549,17 @@ class QuantizerProcessor(LoopProcessor):
         _ = tensors
 
     def has_captured_input_ids(self, name: str) -> bool:
-        if self.capture_mode == "none":
-            if name not in self._split_modules:
-                return False
-            collectors = getattr(self, "_collectors", None)
-            if isinstance(collectors, dict) and collectors:
-                by_short = getattr(self, "_collectors_by_short_name", None)
-                if isinstance(by_short, dict):
-                    collector = by_short.get(name)
-                    if collector is not None:
-                        return collector.nsamples > 0
-                for key, collector in collectors.items():
-                    if key == name or key.endswith(f".{name}"):
-                        return collector.nsamples > 0
-                return False
-            return True
-
-        task = self.tasks.get(name)
-        if task is None:
+        if name not in self._split_modules:
             return False
-        return task.fwd_counter > 0
+        collectors = getattr(self, "_collectors", None)
+        if isinstance(collectors, dict) and collectors:
+            by_short = getattr(self, "_collectors_by_short_name", None)
+            if isinstance(by_short, dict):
+                collector = by_short.get(name)
+                if collector is not None:
+                    return collector.nsamples > 0
+            for key, collector in collectors.items():
+                if key == name or key.endswith(f".{name}"):
+                    return collector.nsamples > 0
+            return False
+        return True

@@ -1736,10 +1736,14 @@ def get_state_dict_for_save(model: nn.Module, offload_root: Optional[str] = None
         )
     return state_dict
 
-# Call tied_weights() after load_checkpoint_in_model() to have the weights tied correctly.
+# Call tied_weights() before and after load_checkpoint_in_model() so accelerate
+# does not warn about untied weights during infer_auto_device.
 def load_checkpoint_in_model_then_tie_weights(model, *args, **kwargs):
+    if hasattr(model, "tie_weights") and getattr(getattr(model, "config", None), "tie_word_embeddings", False):
+        model.tie_weights()
     accelerate.load_checkpoint_in_model(model, *args, **kwargs)
-    model.tie_weights()
+    if hasattr(model, "tie_weights"):
+        model.tie_weights()
 
 
 # 32MB read/write i/o buffer

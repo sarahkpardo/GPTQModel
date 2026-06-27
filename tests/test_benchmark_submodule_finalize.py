@@ -12,9 +12,11 @@ from unittest import mock
 import pytest
 import torch
 
-from gptqmodel.looper import gptq_processor as gptq_processor_module
+from gptqmodel.looper import quantizer_processor as quantizer_processor_module
 from gptqmodel.looper.gptq_processor import GPTQProcessor
 from gptqmodel.looper.named_module import NamedModule
+from gptqmodel.looper.ptq_keys import PTQ_CONTEXT_KEY, PTQ_TRANSFORM_KEY
+from gptqmodel.ptq.context import ModuleCalibContext, TransformState
 from gptqmodel.nn_modules.qlinear.torch import TorchLinear
 from gptqmodel.quantization.config import QuantizeConfig
 from gptqmodel.utils.threadx import DeviceThreadPool
@@ -155,6 +157,22 @@ def test_submodule_finalize_timing():
     processor.pb = _DummyProgressBar()
 
     processor.preprocess(named_module)
+    features = named_module.module.weight.shape[1]
+    named_module.state[PTQ_CONTEXT_KEY] = ModuleCalibContext(
+        H=torch.eye(features, device=device, dtype=torch.float32),
+        nsamples=64,
+    )
+    named_module.state[PTQ_TRANSFORM_KEY] = TransformState(method="identity", bake_weights=True)
+
+    fake_result = SimpleNamespace(
+        pack_weight=named_module.module.weight.detach().clone(),
+        q_scales=torch.ones(1),
+        q_zeros=torch.zeros(1, dtype=torch.int32),
+        q_g_idx=None,
+        extra={"loss": 0.01},
+    )
+    processor.optimizer = mock.Mock()
+    processor.optimizer.optimize.return_value = fake_result
     processor.process(named_module)
 
     # move weights to CPU to satisfy create_quant_module invariants
@@ -186,8 +204,8 @@ def test_submodule_finalize_timing():
             events.append((label, gap))
         last_checkpoint = t_now
 
-    original_create = gptq_processor_module.create_quant_module
-    original_pack = gptq_processor_module.pack_module
+    original_create = quantizer_processor_module.create_quant_module
+    original_pack = quantizer_processor_module.pack_module
     original_result_pop = GPTQProcessor.result_pop
     original_unregister = NamedModule.unregister_parameter
 
@@ -242,8 +260,8 @@ def test_submodule_finalize_timing():
     last_checkpoint = start_time
 
     with (
-        mock.patch("gptqmodel.looper.gptq_processor.create_quant_module", new=wrapped_create_quant_module),
-        mock.patch("gptqmodel.looper.gptq_processor.pack_module", new=wrapped_pack_module),
+        mock.patch("gptqmodel.looper.quantizer_processor.create_quant_module", new=wrapped_create_quant_module),
+        mock.patch("gptqmodel.looper.quantizer_processor.pack_module", new=wrapped_pack_module),
         mock.patch.object(GPTQProcessor, "result_pop", new=wrapped_result_pop),
         mock.patch.object(NamedModule, "unregister_parameter", new=wrapped_unregister_parameter),
     ):
@@ -292,6 +310,24 @@ def test_submodule_finalize_timing():
             print(f"  {name:<32} {duration_ms:.3f} (source={source})")
 
 
+def _seed_split_quant_state(processor, named_module, device):
+    features = named_module.module.weight.shape[1]
+    named_module.state[PTQ_CONTEXT_KEY] = ModuleCalibContext(
+        H=torch.eye(features, device=device, dtype=torch.float32),
+        nsamples=64,
+    )
+    named_module.state[PTQ_TRANSFORM_KEY] = TransformState(method="identity", bake_weights=True)
+    fake_result = SimpleNamespace(
+        pack_weight=named_module.module.weight.detach().clone(),
+        q_scales=torch.ones(1),
+        q_zeros=torch.zeros(1, dtype=torch.int32),
+        q_g_idx=None,
+        extra={"loss": 0.01},
+    )
+    processor.optimizer = mock.Mock()
+    processor.optimizer.optimize.return_value = fake_result
+
+
 def _prepare_modules(processor, qcfg, device, module_count):
     modules = []
     for idx in range(module_count):
@@ -306,6 +342,7 @@ def _prepare_modules(processor, qcfg, device, module_count):
         named_module.module.target_device = device
 
         processor.preprocess(named_module, fallback=None)
+        _seed_split_quant_state(processor, named_module, device)
         processor.process(named_module)
 
         base_model.to("cpu")
@@ -371,7 +408,7 @@ def test_submodule_finalize_threadpool_serialization(cpu_workers):
     modules = _prepare_modules(processor, qcfg, device, module_count)
 
     lock_tracker = _LockTracker()
-    original_pack_module = gptq_processor_module.pack_module
+    original_pack_module = quantizer_processor_module.pack_module
 
     def instrumented_pack_module(*args, **kwargs):
         args_list = list(args)
@@ -389,7 +426,7 @@ def test_submodule_finalize_threadpool_serialization(cpu_workers):
     pool = DeviceThreadPool(include_cuda=False, include_cpu=True, workers={"cpu": cpu_workers}, inference_mode=True)
 
     try:
-        with mock.patch.object(gptq_processor_module, "pack_module", new=instrumented_pack_module):
+        with mock.patch.object(quantizer_processor_module, "pack_module", new=instrumented_pack_module):
             futures = [
                 pool.submit(torch.device("cpu"), _finalize_worker, processor, module, quant_model)
                 for module, quant_model in modules

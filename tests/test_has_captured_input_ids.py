@@ -16,13 +16,6 @@ except (ImportError, ModuleNotFoundError, RuntimeError):
     pytest.skip("full gptqmodel import unavailable", allow_module_level=True)
 
 
-def test_inline_has_captured_input_ids_missing_task_returns_false():
-    processor = object.__new__(QuantizerProcessor)
-    processor.capture_mode = "inline"
-    processor.tasks = {}
-    assert processor.has_captured_input_ids("attn.c_attn") is False
-
-
 def test_split_has_captured_input_ids_missing_module_returns_false():
     processor = object.__new__(QuantizerProcessor)
     processor.capture_mode = "none"

@@ -343,13 +343,13 @@ class TestGPTQProcessorStreaming(ModelTest):
 
             sys.modules.setdefault("random_word", SimpleNamespace(RandomWords=lambda: _RandomWords()))
 
-            from gptqmodel.looper.gptq_processor import GPTQProcessor
+            from gptqmodel.looper.quantizer_processor import QuantizerProcessor
             from gptqmodel.looper.named_module import NamedModule
 
             device = torch.device("cuda", 0)
             torch.cuda.set_device(device)
 
-            processor = object.__new__(GPTQProcessor)
+            processor = object.__new__(QuantizerProcessor)
             processor.lock = threading.Lock()
 
             linear = torch.nn.Linear(8, 8, bias=False).to(device=device, dtype=torch.float16)

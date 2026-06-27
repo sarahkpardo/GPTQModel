@@ -28,7 +28,6 @@ import torch.nn as nn
 
 from ..looper.dequantize_processor import DequantizeProcessor
 from ..looper.eora_processor import EoraProcessor
-from ..looper.gptq_processor import GPTQProcessor
 from ..looper.quantizer_processor import QuantizerProcessor
 from ..looper.input_cache import InputCache
 from ..looper.loop_processor import LoopProcessor
@@ -68,8 +67,6 @@ from .awq_processor import AWQProcessor
 from .forward_executor import ForwardExecutor
 from .paroquant_processor import ParoQuantProcessor
 from .qqq_processor import QQQProcessor
-from .statistics_processor import StatisticsProcessor
-from .transform_processor import TransformProcessor
 from .stage_inputs_capture import StageInputsCapture
 from .stage_layer import run_layer_stage
 
@@ -1454,10 +1451,9 @@ class ModuleLooper():
                 if callable(uses_ptq):
                     uses_ptq = uses_ptq()
                 if isinstance(processor, EoraProcessor) or\
-                        isinstance(processor, TransformProcessor) or\
                         (isinstance(processor, QuantizerProcessor) and uses_ptq) or\
-                        (isinstance(processor, GPTQProcessor) and getattr(self.gptq_model.quantize_config, "gptaq", None) is not None) or\
-                        (isinstance(processor, GPTQProcessor) and getattr(self.gptq_model.quantize_config, "foem", None) is not None):
+                        (isinstance(processor, QuantizerProcessor) and getattr(self.gptq_model.quantize_config, "gptaq", None) is not None) or\
+                        (isinstance(processor, QuantizerProcessor) and getattr(self.gptq_model.quantize_config, "foem", None) is not None):
                     prev_processor = self.processors[p_index - 1]
                     processor.set_calibration_dataset(prev_processor.calibration_dataset)
                     # If calibration_dataset is None or Empty, the input_cache of the previous processor is used.
@@ -1588,7 +1584,7 @@ class ModuleLooper():
             for index, reverse_p in enumerate(reversed_processors, start=1):
                 # Finalize processors in reverse order
                 self._check_loop_stop()
-                if isinstance(reverse_p, (GPTQProcessor, QuantizerProcessor)):
+                if isinstance(reverse_p, QuantizerProcessor):
                     pass
                 elif isinstance(reverse_p, EoraProcessor):
                     pass
@@ -1673,7 +1669,7 @@ class ModuleLooper():
             elif capture_only_flags.get(name, False):
                 subset[name].state["capture_only"] = True
 
-            if isinstance(processor, (GPTQProcessor, QuantizerProcessor)):
+            if isinstance(processor, QuantizerProcessor):
                 processor.preprocess(subset[name], fallback=fallback)
             else:
                 processor.preprocess(subset[name])

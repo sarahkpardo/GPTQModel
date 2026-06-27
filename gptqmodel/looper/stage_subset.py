@@ -28,7 +28,7 @@ from .awq_processor import AWQProcessor
 from .paroquant_processor import ParoQuantProcessor
 from .qqq_processor import QQQProcessor
 from .. import DEBUG_ON, DEVICE_THREAD_POOL
-from ..looper.gptq_processor import GPTQProcessor
+from ..looper.quantizer_processor import QuantizerProcessor
 from ..looper.quantizer_processor import QuantizerProcessor
 from ..looper.sequential_ptq_processor import SequentialPTQProcessor
 from ..looper.loop_processor import LoopProcessor
@@ -207,7 +207,7 @@ def _resolve_subset_calibration_coverage_policy(
 
     validate_input_coverage = isinstance(
         processor,
-        (GPTQProcessor, QuantizerProcessor, SequentialPTQProcessor, QQQProcessor, AWQProcessor, ParoQuantProcessor),
+        (QuantizerProcessor, SequentialPTQProcessor, QQQProcessor, AWQProcessor, ParoQuantProcessor),
     )
     fallback_enabled = fallback is not None
     prune_uncovered_modules = validate_input_coverage and not fallback_enabled

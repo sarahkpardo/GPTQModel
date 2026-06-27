@@ -16,10 +16,6 @@ def build_transform_backend(cfg: TransformPrepareConfig) -> TransformBackend:
         from .paroquant import ParoQuantTransform
 
         return ParoQuantTransform(cfg)
-    if method == "wush":
-        from .wush import WUSHTransform
-
-        return WUSHTransform(cfg)
     if method in {"random_orthogonal", "rand_ortho", "quip_incoherence"}:
         from .random_orthogonal import RandomOrthogonalTransform
 

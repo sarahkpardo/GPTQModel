@@ -17,8 +17,7 @@ from ..looper.loop_processor import (
 )
 from ..looper.named_module import NamedModule
 from ..looper.quantizer_processor import QuantizerProcessor, clone_gptq_config_for_module
-from ..looper.statistics_processor import PTQ_CONTEXT_KEY, PTQ_STATS_KEY
-from ..looper.transform_processor import PTQ_TRANSFORM_KEY
+from ..looper.ptq_keys import PTQ_CONTEXT_KEY, PTQ_STATS_KEY, PTQ_TRANSFORM_KEY
 from ..models import BaseQModel
 from ..models.writer import (
     PROCESS_LOG_LAYER,

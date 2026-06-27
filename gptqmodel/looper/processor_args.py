@@ -24,7 +24,7 @@ QUANTIZER_ONLY_KEYS = frozenset({
 
 
 def calibration_processor_kwargs(args: Dict[str, Any]) -> Dict[str, Any]:
-    """Return kwargs accepted by statistics/transform calibration processors."""
+    """Return kwargs accepted by SequentialPTQProcessor calibration wiring."""
     return {k: v for k, v in args.items() if k in CALIBRATION_PROCESSOR_KEYS}
 
 
