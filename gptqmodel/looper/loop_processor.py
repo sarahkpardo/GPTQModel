@@ -24,7 +24,7 @@ from ..models.writer import (PROCESS_LOG_FWD_TIME, PROCESS_LOG_LAYER, PROCESS_LO
                              QUANT_LOG_NSAMPLES)
 from ..quantization.config import QuantizeConfig
 from ..utils.colors import ANSIColor, color_text
-from ..utils.logger import setup_logger
+from ..utils.logger import LayerQuantDashboard, layer_dashboard_enabled, render_table, setup_logger
 from ..utils.random_str import get_random_string
 from ..utils.torch import CPU, DEVICE_0, DEVICE_1, HAS_NPU
 
@@ -140,6 +140,7 @@ class LoopProcessor:
         self._log_header_interval = 20
         current_time = datetime.now().strftime("%m_%d_%Y_%Hh_%Mm_%Ss")
         self.log_tmp_log_file_name = str(self._build_log_file_path(self.name(), current_time))
+        self._layer_dashboard = LayerQuantDashboard() if layer_dashboard_enabled() else None
         self._device_smi_handles = self._init_device_smi_handles()
         self._cpu_device_smi = self._init_cpu_device_handle()
         self._device_metric_failures: Set[str] = set()
@@ -282,19 +283,21 @@ class LoopProcessor:
 
         with self.lock:
             self.log_call_count += 1
-            columns_rebuilt = self._ensure_log_columns(stat)
 
-            if self._log_columns is None:
-                return
+            if self._layer_dashboard is None:
+                columns_rebuilt = self._ensure_log_columns(stat)
 
-            if columns_rebuilt or self.log_call_count % self._log_header_interval == 1:
-                self._log_columns.info.header()
+                if self._log_columns is None:
+                    return
 
-            row_values = [
-                self._format_log_value(column, stat.get(column, ""), stat)
-                for column in self._log_column_labels
-            ]
-            self._log_columns.info(*row_values)
+                if columns_rebuilt or self.log_call_count % self._log_header_interval == 1:
+                    self._log_columns.info.header()
+
+                row_values = [
+                    self._format_log_value(column, stat.get(column, ""), stat)
+                    for column in self._log_column_labels
+                ]
+                self._log_columns.info(*row_values)
 
             # Emit a plain-text summary when debugging quantization quality in test runs.
             if os.getenv("GPTQMODEL_LOG_QUANT_STATS", "0") not in ("", "0", "false", "False"):
@@ -309,6 +312,45 @@ class LoopProcessor:
                 )
 
         self.log_save_async(stat)
+
+    def flush_layer_dashboard(self, layer_index: int, *, layer_label: str = "") -> None:
+        """Redraw an in-place summary table for all modules completed in one layer."""
+        if self._layer_dashboard is None:
+            return
+        with self.lock:
+            rows = [
+                row for row in self.log
+                if str(row.get(PROCESS_LOG_LAYER, "")) == str(layer_index)
+            ]
+        label = layer_label or str(layer_index)
+        self._layer_dashboard.render(layer_index=layer_index, layer_label=label, rows=rows)
+
+    def write_full_log_summary(self) -> Optional[str]:
+        """Write a human-readable summary table to disk and report its path once."""
+        if not self.log:
+            return None
+
+        summary_path = Path(self.log_tmp_log_file_name).with_suffix(".summary.log")
+        labels = list(DEFAULT_LOG_COLUMNS)
+        for row in self.log:
+            for key in row:
+                if key not in labels:
+                    labels.append(key)
+
+        table_rows = [[row.get(label, "") for label in labels] for row in self.log]
+        table_text = render_table(table_rows, headers=labels, tablefmt="grid")
+
+        with open(summary_path, "w", encoding="utf-8") as handle:
+            handle.write(f"# Processor: {self.name()}\n")
+            handle.write(f"# JSON log: {self.log_tmp_log_file_name}\n")
+            handle.write(f"# Modules: {len(self.log)}\n\n")
+            handle.write(table_text)
+            handle.write("\n")
+
+        log.info(
+            f"Quant log written to: {summary_path} (JSON rows: {self.log_tmp_log_file_name})"
+        )
+        return str(summary_path)
 
     def loss_color(self, loss_value: float) -> ANSIColor:
         """Maps a quantization loss value to a terminal highlight color."""
@@ -776,6 +818,8 @@ class LoopProcessor:
     def finalize(self, model: BaseQModel, **kwargs):
         """Releases shared processor resources after the full quantization loop."""
 
+        if self._layer_dashboard is not None:
+            self._layer_dashboard.close()
         self._close_device_smi_handles()
         del self.inputs_cache
         del self._results

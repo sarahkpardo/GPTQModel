@@ -1588,22 +1588,19 @@ class ModuleLooper():
             for index, reverse_p in enumerate(reversed_processors, start=1):
                 # Finalize processors in reverse order
                 self._check_loop_stop()
-                if isinstance(reverse_p, (GPTQProcessor, QuantizerProcessor)):
-                    pass
-                elif isinstance(reverse_p, EoraProcessor):
-                    pass
-                elif isinstance(reverse_p, DequantizeProcessor):
-                    pass
-                else:
-                    log.info(f"{reverse_p.name()} summary:\n{reverse_p.log}")
-
                 processor_name = reverse_p.name()
-                total_log[processor_name] = reverse_p.log
-                if processor_name in ["gptq", "gptq v2", "awq"]:
-                    self.gptq_model.quant_log = reverse_p.log
+                if isinstance(reverse_p, (GPTQProcessor, QuantizerProcessor, ParoQuantProcessor)):
+                    reverse_p.write_full_log_summary()
+                    total_log[processor_name] = reverse_p.log
+                    if processor_name in ["gptq", "gptq v2", "awq", "sequential-ptq", "rtn", "paroquant"]:
+                        self.gptq_model.quant_log = reverse_p.log
+                else:
+                    total_log[processor_name] = reverse_p.log
+                    if not isinstance(reverse_p, (EoraProcessor, DequantizeProcessor)):
+                        log.info(f"{reverse_p.name()} summary:\n{reverse_p.log}")
+                        for module_log in reverse_p.log:
+                            log.info(module_log)
 
-                for module_log in reverse_p.log:
-                    log.info(module_log)
                 reverse_p.log_plotly()
 
                 finalize_start = time.perf_counter() if region_timer is not None else None

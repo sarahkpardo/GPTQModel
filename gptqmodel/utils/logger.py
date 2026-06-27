@@ -4,6 +4,7 @@
 # Contact: qubitium@modelcloud.ai, x.com/qubitium
 
 import contextlib
+import logging
 import numbers
 import os
 import sys
@@ -103,7 +104,161 @@ def live_renderables_suppressed() -> bool:
     return _suppress_live_renderables()
 
 
+_THIRD_PARTY_LOGGERS = (
+    "httpx",
+    "httpcore",
+    "urllib3",
+    "huggingface_hub",
+    "datasets",
+    "filelock",
+    "accelerate",
+)
+
+_THIRD_PARTY_LOGGING_CONFIGURED = False
+
+
+def _configure_third_party_logging() -> None:
+    """Suppress noisy HTTP/progress logs unless GPTQMODEL_VERBOSE is set."""
+    global _THIRD_PARTY_LOGGING_CONFIGURED
+    if _THIRD_PARTY_LOGGING_CONFIGURED:
+        return
+    _THIRD_PARTY_LOGGING_CONFIGURED = True
+
+    verbose = os.environ.get("GPTQMODEL_VERBOSE", "").strip().lower() in {"1", "true", "yes", "on"}
+    if verbose:
+        return
+
+    level = logging.WARNING
+    for name in _THIRD_PARTY_LOGGERS:
+        logging.getLogger(name).setLevel(level)
+
+    try:
+        from transformers.utils import logging as hf_logging
+
+        hf_logging.disable_progress_bar()
+        hf_logging.set_verbosity_error()
+    except Exception:
+        pass
+
+
+def layer_dashboard_enabled() -> bool:
+    """Return True when the per-layer in-place quant dashboard should be used."""
+    flag = os.environ.get("GPTQMODEL_LAYER_DASHBOARD", "").strip().lower()
+    if flag in {"0", "false", "no", "off"}:
+        return False
+    if live_renderables_suppressed():
+        return False
+    try:
+        return sys.stdout.isatty()
+    except Exception:
+        return False
+
+
+LAYER_DASHBOARD_COLUMNS: tuple[str, ...] = (
+    "method",
+    "module",
+    "loss",
+    "nsamples",
+    "damp",
+    "time_s",
+)
+
+
+class LayerQuantDashboard:
+    """In-place terminal summary refreshed after each layer (top/nvidia-smi style)."""
+
+    _STAT_KEY_MAP = {
+        "method": "method",
+        "module": "module",
+        "loss": "loss",
+        "nsamples": "nsamples",
+        "damp": "damp_percent",
+        "time_s": "time",
+    }
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._lines_printed = 0
+
+    def close(self) -> None:
+        """Leave the terminal on a fresh line after the last in-place redraw."""
+        with self._lock:
+            if self._lines_printed > 0:
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                self._lines_printed = 0
+
+    def render(
+        self,
+        *,
+        layer_index: int,
+        layer_label: str,
+        rows: Sequence[Dict[str, Any]],
+    ) -> None:
+        if not rows:
+            return
+
+        display_rows: list[list[str]] = []
+        for stat in rows:
+            display_rows.append([self._cell(stat, column) for column in LAYER_DASHBOARD_COLUMNS])
+
+        header = f"Layer {layer_index} ({layer_label}) — {len(rows)} module(s)"
+        table = render_table(
+            display_rows,
+            headers=list(LAYER_DASHBOARD_COLUMNS),
+            tablefmt="grid",
+        )
+        output = f"{header}\n{table}\n"
+
+        with self._lock:
+            if self._lines_printed > 0:
+                sys.stdout.write(f"\033[{self._lines_printed}A\033[J")
+            sys.stdout.write(output)
+            sys.stdout.flush()
+            self._lines_printed = output.count("\n")
+
+    @classmethod
+    def _cell(cls, stat: Dict[str, Any], column: str) -> str:
+        for key in (column, cls._STAT_KEY_MAP.get(column, "")):
+            if not key:
+                continue
+            if key in stat and stat[key] not in (None, ""):
+                return str(stat[key])
+        legacy_keys = {
+            "method": "method",
+            "module": "module",
+            "loss": "loss",
+            "nsamples": "nsamples",
+            "damp": "damp_percent",
+            "time_s": "time",
+        }
+        from ..models.writer import (
+            PROCESS_LOG_MODULE,
+            PROCESS_LOG_NAME,
+            PROCESS_LOG_TIME,
+            QUANT_LOG_DAMP,
+            QUANT_LOG_LOSS,
+            QUANT_LOG_NSAMPLES,
+        )
+
+        writer_map = {
+            "method": PROCESS_LOG_NAME,
+            "module": PROCESS_LOG_MODULE,
+            "loss": QUANT_LOG_LOSS,
+            "nsamples": QUANT_LOG_NSAMPLES,
+            "damp": QUANT_LOG_DAMP,
+            "time_s": PROCESS_LOG_TIME,
+        }
+        writer_key = writer_map.get(column)
+        if writer_key and writer_key in stat:
+            return str(stat[writer_key])
+        fallback = legacy_keys.get(column, column)
+        value = stat.get(fallback, "")
+        return "" if value is None else str(value)
+
+
 def setup_logger():
+    _configure_third_party_logging()
     return _AdaptiveLoggerProxy(LogBar.shared())
 
 

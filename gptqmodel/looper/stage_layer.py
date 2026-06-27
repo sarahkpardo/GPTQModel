@@ -733,6 +733,8 @@ def run_layer_stage(
                 if region_timer is not None:
                     region_timer.flush()
 
+                processor.flush_layer_dashboard(layer_index, layer_label=str(layer_descriptor))
+
             if execution_config.fwd_replay_after_process:
                 if layer_outputs:
                     processor.clear_cache_data()
