@@ -219,6 +219,7 @@ class TorchLinear(PackableQuantLinear):
         return self._weight_metadata
 
     def dequantize_weight(self, num_itr: int = 1):
+        self._init_wf_unsqueeze_buffers()
         # Triton dequant currently handles the common single-iteration layout.
         # Multi-iteration requests (num_itr > 1) are routed to the torch path below.
         if (
@@ -458,6 +459,7 @@ class TorchLinear(PackableQuantLinear):
         return width
 
     def _stream_decode_qzeros(self):
+        self._init_wf_unsqueeze_buffers()
         cache_state = (self.qzeros.data_ptr(), self.qzeros.device, self.scales.shape)
         if self._zeros_cache is not None and self._zeros_cache_state == cache_state:
             return self._zeros_cache

@@ -397,6 +397,37 @@ def test_cpu_dequant_parity_and_g_idx_cache_allocation():
     assert module._g_idx_long_cache is not None
 
 
+def test_cpu_cached_dequant_without_post_init_initializes_wf_buffers():
+    bits = 4
+    group_size = 128
+    in_features = 256
+    out_features = 256
+
+    torch.manual_seed(0)
+    linear, scales, zeros, g_idx = _mock_gptq_linear(bits, group_size, in_features, out_features)
+
+    module = TorchLinear(
+        bits=bits,
+        group_size=group_size,
+        sym=True,
+        desc_act=False,
+        in_features=in_features,
+        out_features=out_features,
+        pack_dtype=torch.int32,
+        bias=False,
+    )
+    module.optimize = lambda *args, **kwargs: None
+    module.pack_block(linear, scales.T, zeros.T, g_idx=g_idx)
+    module.eval()
+    module = module.to(device=torch.device("cpu"))
+
+    assert not hasattr(module, "wf_unsqueeze_zero")
+    with torch.inference_mode():
+        weights = module.dequantize_weight(num_itr=1)
+    assert weights.shape == (in_features, out_features)
+    assert module.wf_unsqueeze_zero is not None
+
+
 def test_cpu_cached_dequant_num_itr_matches_packable():
     bits = 4
     group_size = 128

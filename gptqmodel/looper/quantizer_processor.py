@@ -658,6 +658,7 @@ class QuantizerProcessor(LoopProcessor):
 
         qmodule = qModules.get(module.full_name)
         if qmodule is not None:
+            qmodule.post_init()
             self._register_ptq_inference_hooks(module, qmodule)
 
         with self.lock:

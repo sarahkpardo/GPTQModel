@@ -1148,10 +1148,21 @@ class BaseQModel(nn.Module):
         )
 
         with gc_context:
-            return module_looper.loop(
+            quant_log = module_looper.loop(
                 backend=backend,
                 fallback=self.quantize_config.fallback,
             )
+
+        if self.quantized:
+            from ..utils.model import gptqmodel_post_init
+
+            gptqmodel_post_init(
+                self.model,
+                use_act_order=self.quantize_config.desc_act,
+                quantize_config=self.quantize_config,
+            )
+
+        return quant_log
 
     def _quantize_weight_only(
         self,
