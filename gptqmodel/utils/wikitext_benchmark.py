@@ -189,6 +189,26 @@ def compute_wikitext_perplexity(
     return math.exp(total_nll / len(seqs))
 
 
+@torch.no_grad()
+def compute_logits_relative_error(
+    model: Union[nn.Module, Any],
+    tokenizer: PreTrainedTokenizerBase,
+    prompt: str,
+    reference_logits: torch.Tensor,
+    device: torch.device,
+) -> float:
+    """Mean relative logits error vs a reference forward on the same prompt."""
+    module = _unwrap_model(model)
+    module.eval()
+    batch = tokenizer(prompt, return_tensors="pt")
+    batch = {key: value.to(device) for key, value in batch.items()}
+    with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
+        logits = module(**batch).logits
+    ref = reference_logits.to(device=logits.device, dtype=logits.dtype)
+    denom = ref.abs().mean().clamp(min=1e-6)
+    return float((logits - ref).abs().mean().item() / denom.item())
+
+
 def mean_quant_loss(quantize_result: dict[str, list[dict[str, str]]]) -> float | None:
     """Average numeric module ``loss`` values from ``GPTQModel.quantize()`` log output."""
     from .random_orthogonal_diag import summarize_quant_log

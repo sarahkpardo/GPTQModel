@@ -285,6 +285,8 @@ def _resolve_backend(device: str, *, weight_export: WeightExportMode | None = No
         return BACKEND.TORCH
     if weight_export == "paroquant" and device.startswith("cuda"):
         return BACKEND.PAROQUANT_CUDA
+    if device.startswith("cuda"):
+        return BACKEND.TORCH
     return None
 
 
@@ -368,8 +370,8 @@ def _run_pipeline_smoke(
     del model
 
     reload_kwargs = {"device": device}
-    if backend is not None:
-        reload_kwargs["backend"] = backend
+    if quantize_backend is not None:
+        reload_kwargs["backend"] = quantize_backend
     print("Reloading quantized checkpoint...")
     reloaded = GPTQModel.load(str(output_dir), **reload_kwargs)
 

@@ -20,6 +20,7 @@ if str(ROOT) not in sys.path:
 from gptqmodel import BACKEND, GPTQModel, QuantizeConfig  # noqa: E402
 from gptqmodel.utils.moe_benchmark import benchmark_quantize_load_kwargs, configure_moe_quantize_config  # noqa: E402
 from gptqmodel.utils.wikitext_benchmark import (  # noqa: E402
+    compute_logits_relative_error,
     compute_wikitext_perplexity,
     load_wikitext_calibration,
 )
@@ -128,6 +129,86 @@ def test_wikitext_quantize_reload_perplexity(tmp_path: Path, weight_prepare: str
     with torch.no_grad():
         logits = reloaded.model(**batch).logits
     assert torch.isfinite(logits).all()
+
+
+def test_identity_quant_ppl_within_loose_fp16_factor(tmp_path: Path):
+    """Post-reload identity GPTQ PPL should stay within a loose multiple of FP16 baseline."""
+    _require_datasets()
+    model_id = _require_benchmark_model_id()
+
+    baseline = GPTQModel.load(model_id, backend=BACKEND.TORCH, device="cpu")
+    calibration = load_wikitext_calibration(
+        baseline.tokenizer,
+        max_samples=_CALIB_SAMPLES,
+        min_length=10,
+    )
+    assert calibration
+
+    eval_device = next(baseline.model.parameters()).device
+    fp16_ppl = compute_wikitext_perplexity(
+        baseline,
+        baseline.tokenizer,
+        eval_device,
+        seq_len=_EVAL_SEQ_LEN,
+        n_tokens=_EVAL_N_TOKENS,
+    )
+    assert math.isfinite(fp16_ppl)
+
+    qcfg = _build_quantize_config(weight_prepare="identity", model_id=model_id)
+    model = GPTQModel.load(model_id, quantize_config=qcfg, backend=BACKEND.TORCH, device="cpu")
+    configure_moe_quantize_config(model, model.quantize_config)
+    model.quantize(
+        calibration,
+        batch_size=1,
+        backend=BACKEND.TORCH,
+        calibration_data_min_length=10,
+        calibration_concat_size=512,
+    )
+
+    ppl_pre_reload = compute_wikitext_perplexity(
+        model,
+        model.tokenizer,
+        eval_device,
+        seq_len=_EVAL_SEQ_LEN,
+        n_tokens=_EVAL_N_TOKENS,
+    )
+
+    quantized_dir = tmp_path / "quantized-identity"
+    model.save(str(quantized_dir))
+    del model
+
+    reloaded = GPTQModel.load(str(quantized_dir), backend=BACKEND.TORCH, device="cpu")
+    ppl_post_reload = compute_wikitext_perplexity(
+        reloaded,
+        reloaded.tokenizer,
+        eval_device,
+        seq_len=_EVAL_SEQ_LEN,
+        n_tokens=_EVAL_N_TOKENS,
+    )
+
+    prompt = calibration[0][:256]
+    baseline.model.eval()
+    with torch.no_grad():
+        ref_logits = baseline.model(
+            **baseline.tokenizer(prompt, return_tensors="pt").to(eval_device)
+        ).logits.detach().cpu()
+    del baseline
+
+    logits_err = compute_logits_relative_error(
+        reloaded,
+        reloaded.tokenizer,
+        prompt,
+        ref_logits,
+        eval_device,
+    )
+    del reloaded
+
+    max_factor = 5.0
+    assert ppl_post_reload < fp16_ppl * max_factor, (
+        f"identity post-reload PPL {ppl_post_reload:.4f} exceeds {max_factor}x FP16 "
+        f"baseline {fp16_ppl:.4f} (pre-reload={ppl_pre_reload:.4f})"
+    )
+    assert logits_err < 0.75, f"logits rel error vs FP16 too high: {logits_err:.4f}"
 
 
 def test_benchmark_script_runs(tmp_path: Path):
