@@ -207,7 +207,6 @@ def run_single_module_diag(
             trust_remote_code=trust_remote_code,
         ),
         "backend": BACKEND.TORCH,
-        "device": device,
     }
     if trust_remote_code:
         load_kwargs["trust_remote_code"] = True
@@ -314,11 +313,28 @@ def run_full_model_audit(
             }
         ]
 
-    load_kwargs = {"quantize_config": QuantizeConfig(**kwargs), "backend": BACKEND.TORCH, "device": device}
+    load_kwargs = {"quantize_config": QuantizeConfig(**kwargs), "backend": BACKEND.TORCH}
     if trust_remote_code:
         load_kwargs["trust_remote_code"] = True
 
-    fp16_load: dict[str, object] = {"backend": BACKEND.TORCH, "device": device}
+    fp16_kwargs = dict(
+        bits=bits,
+        group_size=group_size,
+        sym=True,
+        desc_act=False,
+        damp_percent=damp_percent,
+        device=device,
+        hessian={"factorization": "cholesky", "row_buffer_max_rows": 512},
+        weight_prepare=[{"method": "identity"}],
+        weight_quantize={"method": "gptq"},
+        weight_export={"format": "gptq"},
+    )
+    fp16_kwargs.update(benchmark_quantize_load_kwargs(model_id, trust_remote_code=trust_remote_code))
+    fp16_qcfg = QuantizeConfig(**fp16_kwargs)
+    fp16_load: dict[str, object] = {
+        "quantize_config": fp16_qcfg,
+        "backend": BACKEND.TORCH,
+    }
     if trust_remote_code:
         fp16_load["trust_remote_code"] = True
     fp16_reference = GPTQModel.load(model_id, **fp16_load)
@@ -401,19 +417,18 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    load_kwargs = {"backend": BACKEND.TORCH}
-    if args.device:
-        load_kwargs["device"] = args.device
-    if args.trust_remote_code:
-        load_kwargs["trust_remote_code"] = True
-    tokenizer_model = GPTQModel.load(args.model_id, **load_kwargs)
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model_id,
+        trust_remote_code=args.trust_remote_code,
+    )
     calibration = load_wikitext_calibration(
-        tokenizer_model.tokenizer,
+        tokenizer,
         max_samples=args.calib_samples,
         min_length=10,
         concat_size=args.calib_concat_size if args.calib_concat_size > 0 else 0,
     )
-    del tokenizer_model
 
     module_name = args.module_name
     if module_name is None and args.mode in {"single_module", "both"}:
