@@ -930,6 +930,252 @@ def compare_hidden_states_pre_post(
     }
 
 
+def _has_submodule(model: nn.Module, name: str) -> bool:
+    try:
+        model.get_submodule(name)
+        return True
+    except (AttributeError, ModuleNotFoundError):
+        return False
+
+
+def default_fine_hidden_state_probe_names(
+    model: nn.Module,
+    *,
+    layer_index: int = 0,
+    layers_prefix: str = "model.layers",
+) -> list[str]:
+    """Return finer layer-0 probes (embed + sub-blocks) that exist on ``model``."""
+    prefix = f"{layers_prefix}.{layer_index}"
+    candidates = [
+        "model.embed_tokens",
+        f"{prefix}.input_layernorm",
+        f"{prefix}.self_attn",
+        f"{prefix}.post_attention_layernorm",
+        f"{prefix}.mlp",
+        prefix,
+    ]
+    return [name for name in candidates if _has_submodule(model, name)]
+
+
+def merge_probe_names(*sequences: Sequence[str]) -> list[str]:
+    """Merge probe name lists preserving order and removing duplicates."""
+    merged: list[str] = []
+    seen: set[str] = set()
+    for sequence in sequences:
+        for name in sequence:
+            if name not in seen:
+                seen.add(name)
+                merged.append(name)
+    return merged
+
+
+def audit_accelerate_dispatch(model: nn.Module) -> dict[str, object]:
+    """Snapshot accelerate dispatch state: ``hf_device_map`` and hook counts."""
+    hf_device_map = getattr(model, "hf_device_map", None)
+    modules_with_hf_hook: list[str] = []
+    align_devices_hook_count = 0
+    try:
+        from accelerate.hooks import AlignDevicesHook
+    except ImportError:
+        AlignDevicesHook = None  # type: ignore[misc, assignment]
+
+    for name, module in model.named_modules():
+        hook = getattr(module, "_hf_hook", None)
+        if hook is None:
+            continue
+        modules_with_hf_hook.append(name)
+        if AlignDevicesHook is not None and isinstance(hook, AlignDevicesHook):
+            align_devices_hook_count += 1
+
+    return {
+        "hf_device_map": dict(hf_device_map) if isinstance(hf_device_map, dict) else hf_device_map,
+        "hf_device_map_present": hf_device_map is not None,
+        "align_devices_hook_count": align_devices_hook_count,
+        "modules_with_hf_hook_count": len(modules_with_hf_hook),
+        "modules_with_hf_hook": modules_with_hf_hook[:32],
+    }
+
+
+def strip_accelerate_dispatch_hooks(model: nn.Module) -> int:
+    """Remove accelerate hooks so forwards use plain parameter devices."""
+    from accelerate.hooks import remove_hook_from_module, remove_hook_from_submodules
+
+    before = audit_accelerate_dispatch(model)
+    remove_hook_from_submodules(model)
+    remove_hook_from_module(model, recurse=False)
+    if hasattr(model, "config") and getattr(model.config, "tie_word_embeddings", False):
+        if hasattr(model, "tie_weights"):
+            model.tie_weights()
+    after = audit_accelerate_dispatch(model)
+    return int(before.get("modules_with_hf_hook_count", 0)) - int(
+        after.get("modules_with_hf_hook_count", 0)
+    )
+
+
+def apply_plain_eval_placement(
+    model: nn.Module,
+    device: torch.device | str,
+) -> dict[str, object]:
+    """Strip dispatch hooks, move model to ``device``, and clear TorchLinear caches."""
+    dispatch_before = audit_accelerate_dispatch(model)
+    strip_accelerate_dispatch_hooks(model)
+    model.to(device)
+    cleared = clear_torchlinear_inference_state(model)
+    dispatch_after = audit_accelerate_dispatch(model)
+    param_device = str(next(model.parameters()).device)
+    return {
+        "dispatch_before": dispatch_before,
+        "dispatch_after": dispatch_after,
+        "param_device": param_device,
+        "torchlinear_caches_cleared": cleared,
+    }
+
+
+PplEvalVariant = Literal["skip_second_to", "single_to", "double_to"]
+
+
+def prepare_model_for_ppl_eval_variant(
+    model: Any,
+    eval_device: torch.device | str,
+    variant: PplEvalVariant,
+) -> torch.device:
+    """Apply one post-reload eval placement variant (mirrors benchmark prep)."""
+    eval_device = torch.device(eval_device)
+    if variant == "skip_second_to":
+        clear_torchlinear_inference_state(model.model)
+    elif variant == "single_to":
+        model.to(eval_device)
+        clear_torchlinear_inference_state(model.model)
+    elif variant == "double_to":
+        model.to(eval_device)
+        clear_torchlinear_inference_state(model.model)
+        model.to(eval_device)
+        clear_torchlinear_inference_state(model.model)
+    else:
+        raise ValueError(f"Unknown PPL eval variant: {variant!r}")
+    return next(model.model.parameters()).device
+
+
+def prepare_model_for_ppl_eval_variants() -> dict[str, str]:
+    """Return descriptions of supported post-reload eval placement ablations."""
+    return {
+        "skip_second_to": "No extra model.to() after reload; only clear TorchLinear caches.",
+        "single_to": "One model.to(eval_device) plus cache clear (benchmark default).",
+        "double_to": "Two model.to(eval_device) calls with cache clear between each.",
+    }
+
+
+def reload_gptq_checkpoint_mirror_pre_reload(
+    checkpoint_path: str,
+    *,
+    eval_device: torch.device | str,
+    load_kwargs: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """Reload on CPU then plain ``.to(eval_device)`` to mirror pre-reload placement."""
+    from .. import GPTQModel
+
+    kwargs = dict(load_kwargs or {})
+    kwargs["device"] = "cpu"
+    model = GPTQModel.load(checkpoint_path, **kwargs)
+    dispatch_before = audit_accelerate_dispatch(model.model)
+    placement = apply_plain_eval_placement(model.model, eval_device)
+    return {
+        "model": model,
+        "dispatch_before": dispatch_before,
+        "placement": placement,
+    }
+
+
+def _logits_within_threshold(
+    logits_delta: dict[str, object] | None,
+    *,
+    threshold: float,
+) -> bool | None:
+    if not isinstance(logits_delta, dict):
+        return None
+    rel = logits_delta.get("mean_rel_error")
+    if not isinstance(rel, (int, float)):
+        return None
+    return float(rel) <= threshold
+
+
+def compare_reload_path_ablations(
+    *,
+    reference_logits_delta: dict[str, object] | None,
+    ablations: dict[str, dict[str, object]],
+    logits_threshold: float = 0.05,
+) -> dict[str, object]:
+    """Summarize reload path ablation outcomes vs a broken baseline delta."""
+    baseline_rel = None
+    if isinstance(reference_logits_delta, dict):
+        rel = reference_logits_delta.get("mean_rel_error")
+        if isinstance(rel, (int, float)):
+            baseline_rel = float(rel)
+
+    rows: dict[str, object] = {}
+    for name, payload in ablations.items():
+        logits_delta = payload.get("logits_pre_vs_ablation") or payload.get("logits_delta")
+        row = {
+            "logits_pre_vs_ablation": logits_delta,
+            "hidden_state_pre_vs_ablation": payload.get("hidden_state_pre_vs_ablation")
+            or payload.get("hidden_state_delta"),
+            "dispatch_audit": payload.get("dispatch_audit"),
+            "placement": payload.get("placement"),
+            "ppl": payload.get("ppl"),
+            "forward_vs_dequant": payload.get("forward_vs_dequant"),
+            "logits_match_pre_reload": _logits_within_threshold(
+                logits_delta,
+                threshold=logits_threshold,
+            ),
+        }
+        if baseline_rel is not None and isinstance(logits_delta, dict):
+            rel = logits_delta.get("mean_rel_error")
+            if isinstance(rel, (int, float)):
+                row["logits_improved_vs_baseline"] = float(rel) < baseline_rel
+        rows[name] = row
+
+    single_rel = None
+    double_rel = None
+    single_row = rows.get("skip_second_to") or rows.get("single_to")
+    double_row = rows.get("double_to")
+    if isinstance(single_row, dict):
+        ld = single_row.get("logits_pre_vs_ablation")
+        if isinstance(ld, dict) and isinstance(ld.get("mean_rel_error"), (int, float)):
+            single_rel = float(ld["mean_rel_error"])
+    if isinstance(double_row, dict):
+        ld = double_row.get("logits_pre_vs_ablation")
+        if isinstance(ld, dict) and isinstance(ld.get("mean_rel_error"), (int, float)):
+            double_rel = float(ld["mean_rel_error"])
+
+    return {
+        "logits_threshold": logits_threshold,
+        "baseline_logits_mean_rel_error": baseline_rel,
+        "ablations": rows,
+        "mirror_pre_reload_fixes_logits": _ablation_fixes(rows, "mirror_pre_reload", logits_threshold),
+        "strip_hooks_fixes_logits": _ablation_fixes(rows, "strip_hooks_only", logits_threshold),
+        "skip_second_to_fixes_logits": _ablation_fixes(rows, "skip_second_to", logits_threshold),
+        "double_to_worsens_logits": (
+            single_rel is not None
+            and double_rel is not None
+            and double_rel > single_rel + 1e-6
+        ),
+    }
+
+
+def _ablation_fixes(
+    rows: dict[str, object],
+    key: str,
+    threshold: float,
+) -> bool | None:
+    row = rows.get(key)
+    if not isinstance(row, dict):
+        return None
+    fixed = row.get("logits_match_pre_reload")
+    if isinstance(fixed, bool):
+        return fixed
+    return _logits_within_threshold(row.get("logits_pre_vs_ablation"), threshold=threshold)
+
+
 def summarize_reload_forward_audit(
     *,
     dequant_per_layer: dict[str, object] | None,
@@ -937,8 +1183,11 @@ def summarize_reload_forward_audit(
     forward_vs_dequant: dict[str, object] | None,
     hidden_state_pre_vs_post: dict[str, object] | None,
     device_map_ablation: dict[str, object] | None = None,
+    path_ablation: dict[str, object] | None = None,
+    fine_hidden_state_pre_vs_post: dict[str, object] | None = None,
     forward_gap_threshold: float = 0.05,
     hidden_threshold: float = 0.05,
+    logits_threshold: float = 0.05,
 ) -> dict[str, object]:
     """Summarize reload forward audit results into at-a-glance verdict fields."""
     packed_weights_ok = bool(dequant_per_layer and dequant_per_layer.get("all_match"))
@@ -968,6 +1217,10 @@ def summarize_reload_forward_audit(
         hidden_states_match = bool(hidden_state_pre_vs_post.get("hidden_states_match_pre_post"))
         first_diverged = hidden_state_pre_vs_post.get("first_diverged_probe")
 
+    first_fine_diverged = None
+    if fine_hidden_state_pre_vs_post is not None:
+        first_fine_diverged = fine_hidden_state_pre_vs_post.get("first_diverged_probe")
+
     ruled_out: list[str] = []
     if packed_weights_ok:
         ruled_out.append("layerwise_packed_weight_checkpoint_corruption")
@@ -980,13 +1233,34 @@ def summarize_reload_forward_audit(
     if device_map_ablation is not None:
         flat_fixed = device_map_ablation.get("flat_map_fixes_logits_or_ppl")
 
+    mirror_pre_reload_fixes_logits = None
+    strip_hooks_fixes_logits = None
+    skip_second_to_fixes_logits = None
+    double_to_worsens_logits = None
+    if path_ablation is not None:
+        mirror_pre_reload_fixes_logits = path_ablation.get("mirror_pre_reload_fixes_logits")
+        strip_hooks_fixes_logits = path_ablation.get("strip_hooks_fixes_logits")
+        skip_second_to_fixes_logits = path_ablation.get("skip_second_to_fixes_logits")
+        double_to_worsens_logits = path_ablation.get("double_to_worsens_logits")
+        if mirror_pre_reload_fixes_logits is True:
+            ruled_out.append("cuda_side_load_checkpoint_in_model_only")
+        if strip_hooks_fixes_logits is True:
+            ruled_out.append("align_devices_hook_dispatch_only")
+        if skip_second_to_fixes_logits is True:
+            ruled_out.append("second_eval_model_to_corruption")
+
     return {
         "packed_weights_ok": packed_weights_ok,
         "forward_matches_dequant_pre": forward_matches_dequant_pre,
         "forward_matches_dequant_post": forward_matches_dequant_post,
         "hidden_states_match_pre_post": hidden_states_match,
         "first_diverged_probe": first_diverged,
+        "first_fine_diverged_probe": first_fine_diverged,
         "flat_map_ablation_fixes_issue": flat_fixed,
+        "mirror_pre_reload_fixes_logits": mirror_pre_reload_fixes_logits,
+        "strip_hooks_fixes_logits": strip_hooks_fixes_logits,
+        "skip_second_to_fixes_logits": skip_second_to_fixes_logits,
+        "double_to_worsens_logits": double_to_worsens_logits,
         "likely_causes_ruled_out": ruled_out,
     }
 

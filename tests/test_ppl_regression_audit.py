@@ -20,6 +20,7 @@ if str(ROOT) not in sys.path:
 from gptqmodel.nn_modules.qlinear.torch import TorchLinear  # noqa: E402
 from gptqmodel.quantization import FORMAT, METHOD, QuantizeConfig  # noqa: E402
 from gptqmodel.utils.random_orthogonal_diag import (  # noqa: E402
+    audit_accelerate_dispatch,
     audit_checkpoint_load_keys,
     audit_quant_kernel_types,
     audit_tied_weight_aliasing,
@@ -29,10 +30,14 @@ from gptqmodel.utils.random_orthogonal_diag import (  # noqa: E402
     compare_inmem_reload_dequant,
     compare_inmem_reload_dequant_layers,
     compare_logits_tensors,
+    compare_reload_path_ablations,
+    default_fine_hidden_state_probe_names,
     default_forward_audit_module_names,
     measure_identity_torchlinear_mse,
     measure_torchlinear_forward_vs_dequant,
+    merge_probe_names,
     sample_torchlinear_modules_by_layer,
+    strip_accelerate_dispatch_hooks,
     summarize_reload_forward_audit,
 )
 from gptqmodel.utils.model import (  # noqa: E402
@@ -539,6 +544,111 @@ def test_summarize_reload_forward_audit_verdict():
     assert verdict["forward_matches_dequant_post"] is True
     assert verdict["hidden_states_match_pre_post"] is False
     assert "layerwise_packed_weight_checkpoint_corruption" in verdict["likely_causes_ruled_out"]
+
+
+def test_merge_probe_names_preserves_order_and_dedupes():
+    merged = merge_probe_names(
+        ["model.embed_tokens", "model.layers.0"],
+        ["model.layers.0", "model.norm"],
+    )
+    assert merged == ["model.embed_tokens", "model.layers.0", "model.norm"]
+
+
+def test_default_fine_hidden_state_probe_names_skips_missing():
+    class _Layer0(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.input_layernorm = nn.Linear(8, 8, bias=False)
+            self.self_attn = nn.Linear(8, 8, bias=False)
+
+    class _Inner(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed_tokens = nn.Embedding(16, 8)
+            self.layers = nn.ModuleList([_Layer0()])
+
+    class _Root(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = _Inner()
+
+    names = default_fine_hidden_state_probe_names(_Root())
+    assert names[0] == "model.embed_tokens"
+    assert "model.layers.0.input_layernorm" in names
+    assert "model.layers.0.self_attn" in names
+    assert "model.layers.0.post_attention_layernorm" not in names
+    assert "model.layers.0" in names
+
+
+def test_compare_reload_path_ablations_verdict_fields():
+    summary = compare_reload_path_ablations(
+        reference_logits_delta={"mean_rel_error": 1.0},
+        ablations={
+            "mirror_pre_reload": {
+                "logits_pre_vs_ablation": {"mean_rel_error": 0.01},
+            },
+            "strip_hooks_only": {
+                "logits_pre_vs_ablation": {"mean_rel_error": 0.9},
+            },
+            "skip_second_to": {
+                "logits_pre_vs_ablation": {"mean_rel_error": 1.0},
+            },
+            "double_to": {
+                "logits_pre_vs_ablation": {"mean_rel_error": 1.0},
+            },
+        },
+        logits_threshold=0.05,
+    )
+    assert summary["mirror_pre_reload_fixes_logits"] is True
+    assert summary["strip_hooks_fixes_logits"] is False
+    assert summary["skip_second_to_fixes_logits"] is False
+    assert summary["double_to_worsens_logits"] is False
+
+
+def test_summarize_reload_forward_audit_path_ablation_fields():
+    verdict = summarize_reload_forward_audit(
+        dequant_per_layer={"all_match": True},
+        dequant_all_modules=None,
+        forward_vs_dequant={
+            "pre_inmem": {"worst_mean_rel_error": 0.001},
+            "post_reload_layerwise": {"worst_mean_rel_error": 0.002},
+        },
+        hidden_state_pre_vs_post={
+            "hidden_states_match_pre_post": False,
+            "first_diverged_probe": "model.layers.0",
+        },
+        path_ablation={
+            "mirror_pre_reload_fixes_logits": True,
+            "strip_hooks_fixes_logits": False,
+            "skip_second_to_fixes_logits": False,
+            "double_to_worsens_logits": False,
+        },
+        fine_hidden_state_pre_vs_post={
+            "first_diverged_probe": "model.embed_tokens",
+        },
+    )
+    assert verdict["mirror_pre_reload_fixes_logits"] is True
+    assert verdict["first_fine_diverged_probe"] == "model.embed_tokens"
+    assert "cuda_side_load_checkpoint_in_model_only" in verdict["likely_causes_ruled_out"]
+
+
+def test_audit_accelerate_dispatch_counts_hooks():
+    pytest.importorskip("accelerate")
+    from accelerate.hooks import AlignDevicesHook, add_hook_to_module
+
+    inner = nn.Linear(4, 4)
+    add_hook_to_module(inner, AlignDevicesHook("cpu", io_same_device=True))
+    wrapper = nn.Module()
+    wrapper.layer = inner
+    wrapper.hf_device_map = {"": "cpu"}
+
+    audit = audit_accelerate_dispatch(wrapper)
+    assert audit["hf_device_map_present"] is True
+    assert audit["align_devices_hook_count"] == 1
+    removed = strip_accelerate_dispatch_hooks(wrapper)
+    assert removed >= 0
+    after = audit_accelerate_dispatch(wrapper)
+    assert after["align_devices_hook_count"] == 0
 
 
 def test_capture_torchlinear_env_snapshot_reads_flags(monkeypatch):

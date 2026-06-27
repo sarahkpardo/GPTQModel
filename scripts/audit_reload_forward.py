@@ -48,14 +48,21 @@ from gptqmodel.utils.moe_benchmark import (  # noqa: E402
     is_moe_gptq_model,
 )
 from gptqmodel.utils.random_orthogonal_diag import (  # noqa: E402
+    apply_plain_eval_placement,
+    audit_accelerate_dispatch,
     audit_tied_weight_aliasing,
     audit_torchlinear_forward_vs_dequant,
     capture_torchlinear_env_snapshot,
     compare_hidden_states_pre_post,
     compare_inmem_reload_dequant_layers,
     compare_logits_tensors,
+    compare_reload_path_ablations,
+    default_fine_hidden_state_probe_names,
     default_forward_audit_module_names,
     default_hidden_state_probe_names,
+    merge_probe_names,
+    prepare_model_for_ppl_eval_variant,
+    reload_gptq_checkpoint_mirror_pre_reload,
     summarize_reload_forward_audit,
 )
 from gptqmodel.utils.wikitext_benchmark import (  # noqa: E402
@@ -123,6 +130,62 @@ def _run_triton_ablation(
             os.environ["GPTQ_TORCH_TRITON_DEQUANT"] = previous
 
 
+def _resolve_probe_names(model, *, fine_probes: bool) -> tuple[list[str], list[str] | None]:
+    coarse = default_hidden_state_probe_names(model)
+    if not fine_probes:
+        return coarse, None
+    fine = default_fine_hidden_state_probe_names(model)
+    merged = merge_probe_names(fine, coarse)
+    return merged, fine
+
+
+def _capture_ablation_metrics(
+    bench,
+    inmem_model: GPTQModel,
+    variant_model: GPTQModel,
+    *,
+    logits_prompt: str,
+    eval_device: torch.device,
+    audit_input: dict[str, torch.Tensor],
+    module_names: list[str],
+    probe_names: list[str],
+    skip_ppl: bool,
+    eval_seq_len: int,
+    eval_n_tokens: int,
+) -> dict[str, object]:
+    hidden = compare_hidden_states_pre_post(
+        inmem_model.model,
+        variant_model.model,
+        audit_input,
+        probe_names,
+    )
+    logits = bench._capture_reference_logits(variant_model, logits_prompt, eval_device)
+    pre_logits = bench._capture_reference_logits(inmem_model, logits_prompt, eval_device)
+    logits_delta = compare_logits_tensors(pre_logits, logits)
+    forward = audit_torchlinear_forward_vs_dequant(
+        variant_model.model,
+        module_names,
+        audit_input,
+    )
+    ppl = None
+    if not skip_ppl:
+        detail = compute_wikitext_perplexity_detailed(
+            variant_model,
+            variant_model.tokenizer,
+            eval_device,
+            seq_len=eval_seq_len,
+            n_tokens=eval_n_tokens,
+        )
+        ppl = detail.perplexity
+    return {
+        "logits_pre_vs_ablation": logits_delta,
+        "hidden_state_pre_vs_ablation": hidden,
+        "forward_vs_dequant": forward,
+        "dispatch_audit": audit_accelerate_dispatch(variant_model.model),
+        "ppl": ppl,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Audit GPTQ reload forward path regressions.")
     parser.add_argument("--model-id", required=True)
@@ -155,6 +218,31 @@ def main() -> int:
         "--triton-ablation",
         action="store_true",
         help="Re-run post-reload forward/hidden audits with GPTQ_TORCH_TRITON_DEQUANT=0.",
+    )
+    parser.add_argument(
+        "--mirror-pre-reload",
+        action="store_true",
+        help="Reload on CPU then plain .to(cuda) to mirror pre-reload placement.",
+    )
+    parser.add_argument(
+        "--strip-dispatch-ablation",
+        action="store_true",
+        help="After CUDA reload, strip AlignDevicesHook dispatch and plain .to(cuda).",
+    )
+    parser.add_argument(
+        "--skip-eval-to-ablation",
+        action="store_true",
+        help="Post-reload eval without second model.to(cuda).",
+    )
+    parser.add_argument(
+        "--double-eval-to-ablation",
+        action="store_true",
+        help="Post-reload eval with two model.to(cuda) calls.",
+    )
+    parser.add_argument(
+        "--fine-probes",
+        action="store_true",
+        help="Include embed/layer-0 sub-block probes in hidden-state compare.",
     )
     parser.add_argument("--skip-ppl", action="store_true")
     args = parser.parse_args()
@@ -214,7 +302,7 @@ def main() -> int:
 
         pre_eval_device = bench._prepare_model_for_ppl_eval(model, eval_device)
         module_names = default_forward_audit_module_names(model.model)
-        probe_names = default_hidden_state_probe_names(model.model)
+        probe_names, fine_probe_names = _resolve_probe_names(model.model, fine_probes=args.fine_probes)
         audit_input = _audit_batch(model, logits_prompt, pre_eval_device)
         pre_forward = audit_torchlinear_forward_vs_dequant(
             model.model,
@@ -269,6 +357,14 @@ def main() -> int:
             audit_input,
             probe_names,
         )
+        fine_hidden_state_pre_vs_post = None
+        if fine_probe_names:
+            fine_hidden_state_pre_vs_post = compare_hidden_states_pre_post(
+                model.model,
+                reloaded.model,
+                audit_input,
+                fine_probe_names,
+            )
         post_logits = bench._capture_reference_logits(reloaded, logits_prompt, post_eval_device)
         logits_pre_vs_post = compare_logits_tensors(pre_logits, post_logits)
         post_ppl = None
@@ -359,12 +455,156 @@ def main() -> int:
                 model,
             )
 
+        path_ablation_payload: dict[str, object] | None = None
+        run_path_ablation = any(
+            (
+                args.mirror_pre_reload,
+                args.strip_dispatch_ablation,
+                args.skip_eval_to_ablation,
+                args.double_eval_to_ablation,
+            )
+        )
+        if run_path_ablation:
+            ablation_rows: dict[str, dict[str, object]] = {}
+
+            if args.mirror_pre_reload:
+                print("Mirror pre-reload ablation (CPU load + plain .to)...")
+                mirror = reload_gptq_checkpoint_mirror_pre_reload(
+                    str(output_dir),
+                    eval_device=eval_device,
+                    load_kwargs=dict(reload_kwargs),
+                )
+                mirror_model = mirror["model"]
+                mirror_eval = next(mirror_model.model.parameters()).device
+                mirror_metrics = _capture_ablation_metrics(
+                    bench,
+                    model,
+                    mirror_model,
+                    logits_prompt=logits_prompt,
+                    eval_device=mirror_eval,
+                    audit_input=audit_input,
+                    module_names=module_names,
+                    probe_names=probe_names,
+                    skip_ppl=args.skip_ppl,
+                    eval_seq_len=args.eval_seq_len,
+                    eval_n_tokens=args.eval_n_tokens,
+                )
+                mirror_metrics["dispatch_audit"] = mirror.get("dispatch_before")
+                mirror_metrics["placement"] = mirror.get("placement")
+                ablation_rows["mirror_pre_reload"] = mirror_metrics
+                del mirror_model
+
+            if args.strip_dispatch_ablation:
+                print("Strip dispatch hooks ablation on layerwise reload...")
+                reloaded_strip = GPTQModel.load(str(output_dir), **reload_kwargs)
+                dispatch_before = audit_accelerate_dispatch(reloaded_strip.model)
+                placement = apply_plain_eval_placement(reloaded_strip.model, eval_device)
+                strip_eval = next(reloaded_strip.model.parameters()).device
+                strip_metrics = _capture_ablation_metrics(
+                    bench,
+                    model,
+                    reloaded_strip,
+                    logits_prompt=logits_prompt,
+                    eval_device=strip_eval,
+                    audit_input=audit_input,
+                    module_names=module_names,
+                    probe_names=probe_names,
+                    skip_ppl=args.skip_ppl,
+                    eval_seq_len=args.eval_seq_len,
+                    eval_n_tokens=args.eval_n_tokens,
+                )
+                strip_metrics["dispatch_audit"] = dispatch_before
+                strip_metrics["placement"] = placement
+                ablation_rows["strip_hooks_only"] = strip_metrics
+                del reloaded_strip
+
+            if args.skip_eval_to_ablation:
+                print("Skip second model.to() ablation...")
+                reloaded_skip = GPTQModel.load(str(output_dir), **reload_kwargs)
+                skip_eval = prepare_model_for_ppl_eval_variant(
+                    reloaded_skip,
+                    eval_device,
+                    "skip_second_to",
+                )
+                skip_metrics = _capture_ablation_metrics(
+                    bench,
+                    model,
+                    reloaded_skip,
+                    logits_prompt=logits_prompt,
+                    eval_device=skip_eval,
+                    audit_input=audit_input,
+                    module_names=module_names,
+                    probe_names=probe_names,
+                    skip_ppl=args.skip_ppl,
+                    eval_seq_len=args.eval_seq_len,
+                    eval_n_tokens=args.eval_n_tokens,
+                )
+                skip_metrics["dispatch_audit"] = audit_accelerate_dispatch(reloaded_skip.model)
+                ablation_rows["skip_second_to"] = skip_metrics
+                del reloaded_skip
+
+            if args.double_eval_to_ablation:
+                print("Double model.to() ablation...")
+                reloaded_double = GPTQModel.load(str(output_dir), **reload_kwargs)
+                double_eval = prepare_model_for_ppl_eval_variant(
+                    reloaded_double,
+                    eval_device,
+                    "double_to",
+                )
+                double_metrics = _capture_ablation_metrics(
+                    bench,
+                    model,
+                    reloaded_double,
+                    logits_prompt=logits_prompt,
+                    eval_device=double_eval,
+                    audit_input=audit_input,
+                    module_names=module_names,
+                    probe_names=probe_names,
+                    skip_ppl=args.skip_ppl,
+                    eval_seq_len=args.eval_seq_len,
+                    eval_n_tokens=args.eval_n_tokens,
+                )
+                double_metrics["dispatch_audit"] = audit_accelerate_dispatch(reloaded_double.model)
+                ablation_rows["double_to"] = double_metrics
+
+                reloaded_single = GPTQModel.load(str(output_dir), **reload_kwargs)
+                single_eval = prepare_model_for_ppl_eval_variant(
+                    reloaded_single,
+                    eval_device,
+                    "single_to",
+                )
+                single_metrics = _capture_ablation_metrics(
+                    bench,
+                    model,
+                    reloaded_single,
+                    logits_prompt=logits_prompt,
+                    eval_device=single_eval,
+                    audit_input=audit_input,
+                    module_names=module_names,
+                    probe_names=probe_names,
+                    skip_ppl=args.skip_ppl,
+                    eval_seq_len=args.eval_seq_len,
+                    eval_n_tokens=args.eval_n_tokens,
+                )
+                single_metrics["dispatch_audit"] = audit_accelerate_dispatch(reloaded_single.model)
+                ablation_rows["single_to"] = single_metrics
+                del reloaded_single
+                del reloaded_double
+
+            path_ablation_payload = compare_reload_path_ablations(
+                reference_logits_delta=logits_pre_vs_post,
+                ablations=ablation_rows,
+            )
+            path_ablation_payload["raw_ablations"] = ablation_rows
+
         verdict = summarize_reload_forward_audit(
             dequant_per_layer=dequant_per_layer,
             dequant_all_modules=dequant_all_modules,
             forward_vs_dequant=forward_vs_dequant,
             hidden_state_pre_vs_post=hidden_state_pre_vs_post,
             device_map_ablation=device_map_ablation if args.flat_device_map_ablation else None,
+            path_ablation=path_ablation_payload,
+            fine_hidden_state_pre_vs_post=fine_hidden_state_pre_vs_post,
         )
 
         payload = {
@@ -382,7 +622,10 @@ def main() -> int:
             "dequant_all_modules": dequant_all_modules,
             "forward_vs_dequant": forward_vs_dequant,
             "hidden_state_pre_vs_post": hidden_state_pre_vs_post,
+            "fine_hidden_state_pre_vs_post": fine_hidden_state_pre_vs_post,
+            "fine_hidden_state_probe_names": fine_probe_names,
             "device_map_ablation": device_map_ablation if args.flat_device_map_ablation else None,
+            "path_ablation": path_ablation_payload,
             "triton_ablation": triton_ablation_result,
             "tie_weights_pre_reload": audit_tied_weight_aliasing(model.model),
             "tie_weights_post_reload": audit_tied_weight_aliasing(reloaded.model),
