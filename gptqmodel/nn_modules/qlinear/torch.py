@@ -248,6 +248,15 @@ class TorchLinear(PackableQuantLinear):
             log.info.once("Optimize: `TorchLinear` torch.compile skipped on NPU.")
             return
 
+        disable_compile = os.environ.get("GPTQ_TORCH_DISABLE_COMPILE", "0")
+        if disable_compile not in {"0", "false", "False"}:
+            self.optimized = True
+            log.info.once(
+                "Optimize: `TorchLinear` torch.compile disabled via GPTQ_TORCH_DISABLE_COMPILE."
+            )
+            super().optimize()
+            return
+
         if backend is None:
             # MPS doesn't support inductor.
             backend = "inductor" if device_type != "mps" else "aot_eager"

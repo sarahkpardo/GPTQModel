@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import shutil
 import sys
 import tempfile
@@ -49,11 +50,15 @@ from gptqmodel.utils.moe_benchmark import (  # noqa: E402
 )
 from gptqmodel.utils.random_orthogonal_diag import (  # noqa: E402
     audit_ptq_hooks,
+    audit_quant_kernel_types,
+    compare_inmem_reload_dequant,
+    resolve_model_param_dtype,
     summarize_quant_log,
 )
 from gptqmodel.utils.wikitext_benchmark import (  # noqa: E402
     compute_logits_relative_error,
     compute_wikitext_perplexity,
+    compute_wikitext_perplexity_detailed,
     load_wikitext_calibration,
 )
 
@@ -158,6 +163,29 @@ def _capture_reference_logits(model: GPTQModel, prompt: str, device: torch.devic
         return model.model(**batch).logits.detach().cpu()
 
 
+def _kernel_audit_dict(audit) -> dict[str, object]:
+    return {
+        "torch_linear": audit.torch_linear,
+        "marlin_linear": audit.marlin_linear,
+        "other_quant_linear": audit.other_quant_linear,
+        "plain_linear": audit.plain_linear,
+        "sample_torch_linear": audit.sample_torch_linear,
+        "sample_marlin_linear": audit.sample_marlin_linear,
+        "sample_plain_linear": audit.sample_plain_linear,
+        "sample_other_quant_linear": audit.sample_other_quant_linear,
+    }
+
+
+def _ppl_eval_dict(result) -> dict[str, object]:
+    return {
+        "perplexity": result.perplexity,
+        "n_windows": result.n_windows,
+        "all_losses_finite": result.all_losses_finite,
+        "non_finite_window_indices": result.non_finite_window_indices,
+        "mean_loss": result.mean_loss,
+    }
+
+
 def _run_method(
     *,
     model_id: str,
@@ -222,8 +250,11 @@ def _run_method(
     eval_device = _resolve_eval_device(device)
     quant_linear_pre_reload = _count_quant_linear_modules(model)
     hook_audit_pre_reload = audit_ptq_hooks(model.model)
+    kernel_audit_pre = audit_quant_kernel_types(model.model)
+    eval_param_dtype_pre = resolve_model_param_dtype(model.model)
 
     ppl_pre_reload: float | None = None
+    pre_reload_ppl_detail: dict[str, object] | None = None
     pre_reload_eval_device: torch.device | None = None
     if not skip_pre_reload_ppl:
         pre_reload_eval_device = _prepare_model_for_ppl_eval(model, eval_device)
@@ -232,13 +263,20 @@ def _run_method(
             f"Evaluating in-memory PPL ({weight_prepare}) "
             f"on {pre_reload_eval_device} ({pre_reload_n_tokens} tokens)..."
         )
-        ppl_pre_reload = compute_wikitext_perplexity(
+        pre_detail = compute_wikitext_perplexity_detailed(
             model,
             model.tokenizer,
             pre_reload_eval_device,
             seq_len=eval_seq_len,
             n_tokens=pre_reload_n_tokens,
         )
+        ppl_pre_reload = pre_detail.perplexity
+        pre_reload_ppl_detail = _ppl_eval_dict(pre_detail)
+        if not pre_detail.all_losses_finite:
+            print(
+                f"WARNING: in-memory PPL had non-finite losses in windows "
+                f"{pre_detail.non_finite_window_indices}"
+            )
     else:
         print(f"Skipping in-memory PPL ({weight_prepare}); --skip-pre-reload-ppl set.")
 
@@ -253,13 +291,30 @@ def _run_method(
     if reload_backend is not None:
         reload_kwargs["backend"] = reload_backend
     reload_backend_label = reload_backend.value if reload_backend is not None else "auto"
+    if legacy_auto_reload and device.startswith("cuda"):
+        print(
+            "WARNING: --legacy-auto-reload-backend set — CUDA reload uses backend=AUTO "
+            "(typically Marlin). Expect dtype errors on bf16 models such as Qwen3."
+        )
     print(f"Reloading checkpoint with backend={reload_backend_label}...")
     reloaded = GPTQModel.load(str(output_dir), **reload_kwargs)
+
+    dequant_parity = compare_inmem_reload_dequant(model.model, reloaded.model)
+    if not dequant_parity["all_match"]:
+        print(f"WARNING: in-memory vs reload dequant mismatch: {dequant_parity['comparisons'][:1]}")
     del model
 
     hook_count = _count_ptq_hooks(reloaded)
     hook_audit = audit_ptq_hooks(reloaded.model)
     quant_linear_post_reload = _count_quant_linear_modules(reloaded)
+    kernel_audit_post = audit_quant_kernel_types(reloaded.model)
+    eval_param_dtype_post = resolve_model_param_dtype(reloaded.model)
+
+    if kernel_audit_post.marlin_linear > 0 and reload_backend_label == "torch":
+        raise RuntimeError(
+            f"Expected TorchLinear reload backend but found {kernel_audit_post.marlin_linear} "
+            f"MarlinLinear module(s): {kernel_audit_post.sample_marlin_linear}"
+        )
 
     if weight_prepare == "random_orthogonal" and hook_count == 0:
         raise RuntimeError(
@@ -269,13 +324,20 @@ def _run_method(
     print(f"Evaluating post-reload PPL ({weight_prepare})...")
     post_reload_eval_device = next(reloaded.model.parameters()).device
     print(f"PPL eval device: {post_reload_eval_device}")
-    ppl_post_reload = compute_wikitext_perplexity(
+    post_detail = compute_wikitext_perplexity_detailed(
         reloaded,
         reloaded.tokenizer,
         post_reload_eval_device,
         seq_len=eval_seq_len,
         n_tokens=eval_n_tokens,
     )
+    ppl_post_reload = post_detail.perplexity
+    post_reload_ppl_detail = _ppl_eval_dict(post_detail)
+    if not post_detail.all_losses_finite:
+        print(
+            f"WARNING: post-reload PPL had non-finite losses in windows "
+            f"{post_detail.non_finite_window_indices}"
+        )
 
     logits_rel_error = None
     if logits_prompt and reference_logits is not None:
@@ -295,6 +357,12 @@ def _run_method(
         "perplexity": ppl_post_reload,
         "ppl_pre_reload": ppl_pre_reload,
         "ppl_post_reload": ppl_post_reload,
+        "ppl_pre_reload_detail": pre_reload_ppl_detail,
+        "ppl_post_reload_detail": post_reload_ppl_detail,
+        "ppl_pre_reload_loss_finite": (
+            pre_reload_ppl_detail["all_losses_finite"] if pre_reload_ppl_detail else None
+        ),
+        "ppl_post_reload_loss_finite": post_reload_ppl_detail["all_losses_finite"],
         "ppl_reload_delta": (
             (ppl_post_reload - ppl_pre_reload)
             if isinstance(ppl_pre_reload, float) and isinstance(ppl_post_reload, float)
@@ -302,7 +370,12 @@ def _run_method(
         ),
         "pre_reload_eval_device": str(pre_reload_eval_device) if pre_reload_eval_device is not None else None,
         "post_reload_eval_device": str(post_reload_eval_device),
+        "eval_param_dtype_pre_reload": eval_param_dtype_pre,
+        "eval_param_dtype_post_reload": eval_param_dtype_post,
         "reload_backend": reload_backend_label,
+        "kernel_types_pre_reload": _kernel_audit_dict(kernel_audit_pre),
+        "kernel_types_post_reload": _kernel_audit_dict(kernel_audit_post),
+        "dequant_inmem_vs_reload": dequant_parity,
         "mean_quant_loss": avg_loss,
         "max_damp": log_summary.max_damp,
         "modules_with_elevated_damp": log_summary.modules_with_elevated_damp,
@@ -437,6 +510,13 @@ def main() -> int:
     print(f"damp_percent: {args.damp_percent} (legacy random_orthogonal damp: {args.legacy_random_orthogonal_damp})")
     print(f"random_orthogonal inference_precision: {args.inference_precision}")
     print(f"reload backend: {'auto (legacy)' if args.legacy_auto_reload_backend else 'torch'}")
+    if args.legacy_auto_reload_backend and args.device.startswith("cuda"):
+        print(
+            "WARNING: --legacy-auto-reload-backend — CUDA reload will use AUTO (Marlin). "
+            "Use default reload for TORCH parity tests."
+        )
+    compile_disabled = os.environ.get("GPTQ_TORCH_DISABLE_COMPILE", "0") not in {"0", "false", "False"}
+    print(f"GPTQ_TORCH_DISABLE_COMPILE: {compile_disabled}")
 
     ptq_backend = _resolve_ptq_backend(
         args.device,
@@ -552,6 +632,7 @@ def main() -> int:
                     "inference_precision": args.inference_precision,
                     "legacy_random_orthogonal_damp": args.legacy_random_orthogonal_damp,
                     "legacy_auto_reload_backend": args.legacy_auto_reload_backend,
+                    "gptq_torch_disable_compile": compile_disabled,
                     "skip_pre_reload_ppl": args.skip_pre_reload_ppl,
                     "eval_n_tokens_pre_reload": args.eval_n_tokens_pre_reload,
                     "logits_prompt": logits_prompt,

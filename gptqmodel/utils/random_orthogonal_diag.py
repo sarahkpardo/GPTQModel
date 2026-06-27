@@ -53,6 +53,165 @@ class HookAuditResult:
     modules_with_pad: list[tuple[str, int]]
 
 
+@dataclass
+class KernelTypeAudit:
+    torch_linear: int
+    marlin_linear: int
+    other_quant_linear: int
+    plain_linear: int
+    sample_torch_linear: list[str]
+    sample_marlin_linear: list[str]
+    sample_plain_linear: list[str]
+    sample_other_quant_linear: list[str]
+
+
+def resolve_model_param_dtype(model: nn.Module) -> str:
+    """Return the dtype string of the first floating-point parameter, if any."""
+    for param in model.parameters():
+        if param.is_floating_point():
+            return str(param.dtype)
+    return "unknown"
+
+
+def audit_quant_kernel_types(model: nn.Module, *, sample_limit: int = 5) -> KernelTypeAudit:
+    """Count quant kernel module types in a model graph."""
+    from ..nn_modules.qlinear import BaseQuantLinear
+    from ..nn_modules.qlinear.marlin import MarlinLinear
+    from ..nn_modules.qlinear.torch import TorchLinear
+
+    torch_names: list[str] = []
+    marlin_names: list[str] = []
+    plain_names: list[str] = []
+    other_names: list[str] = []
+
+    torch_count = 0
+    marlin_count = 0
+    plain_count = 0
+    other_count = 0
+
+    for name, module in model.named_modules():
+        if isinstance(module, TorchLinear):
+            torch_count += 1
+            if len(torch_names) < sample_limit:
+                torch_names.append(name)
+        elif isinstance(module, MarlinLinear):
+            marlin_count += 1
+            if len(marlin_names) < sample_limit:
+                marlin_names.append(name)
+        elif isinstance(module, BaseQuantLinear):
+            other_count += 1
+            if len(other_names) < sample_limit:
+                other_names.append(f"{name}:{type(module).__name__}")
+        elif isinstance(module, nn.Linear):
+            plain_count += 1
+            if len(plain_names) < sample_limit:
+                plain_names.append(name)
+
+    return KernelTypeAudit(
+        torch_linear=torch_count,
+        marlin_linear=marlin_count,
+        other_quant_linear=other_count,
+        plain_linear=plain_count,
+        sample_torch_linear=torch_names,
+        sample_marlin_linear=marlin_names,
+        sample_plain_linear=plain_names,
+        sample_other_quant_linear=other_names,
+    )
+
+
+@torch.no_grad()
+def compare_inmem_reload_dequant(
+    inmem_model: nn.Module,
+    reloaded_model: nn.Module,
+    *,
+    max_modules: int = 3,
+    rtol: float = 1e-2,
+    atol: float = 1e-2,
+) -> dict[str, object]:
+    """Compare dequantized weights in-memory vs after checkpoint reload."""
+    from ..nn_modules.qlinear.torch import TorchLinear
+
+    comparisons: list[dict[str, object]] = []
+    mismatches: list[dict[str, object]] = []
+
+    inmem_modules = [
+        (name, module)
+        for name, module in inmem_model.named_modules()
+        if isinstance(module, TorchLinear)
+    ]
+
+    for name, inmem_q in inmem_modules[:max_modules]:
+        try:
+            reloaded_q = reloaded_model.get_submodule(name)
+        except (AttributeError, ModuleNotFoundError) as exc:
+            mismatches.append({"module": name, "error": str(exc)})
+            continue
+        if not isinstance(reloaded_q, TorchLinear):
+            mismatches.append(
+                {
+                    "module": name,
+                    "error": f"reloaded type {type(reloaded_q).__name__}, expected TorchLinear",
+                }
+            )
+            continue
+
+        buffers = inmem_q.list_buffers()
+        eval_device = buffers[0].device if buffers else next(inmem_q.parameters()).device
+        reloaded_q = reloaded_q.to(eval_device)
+        w_inmem = inmem_q.dequantize_weight().float().cpu()
+        w_reload = reloaded_q.dequantize_weight().float().cpu()
+        diff = (w_inmem - w_reload).abs()
+        max_abs = float(diff.max().item())
+        mean_abs = float(diff.mean().item())
+        denom = float(w_inmem.abs().mean().clamp(min=1e-6).item())
+        match = bool(torch.allclose(w_inmem, w_reload, rtol=rtol, atol=atol))
+        comparisons.append(
+            {
+                "module": name,
+                "max_abs_diff": max_abs,
+                "mean_abs_diff": mean_abs,
+                "mean_rel_diff": mean_abs / denom,
+                "match": match,
+            }
+        )
+
+    return {
+        "modules_compared": len(comparisons),
+        "all_match": all(bool(row["match"]) for row in comparisons) if comparisons else False,
+        "comparisons": comparisons,
+        "mismatches": mismatches,
+    }
+
+
+@torch.no_grad()
+def measure_identity_torchlinear_mse(
+    fp16_module: nn.Linear,
+    quant_module: nn.Module,
+    *,
+    device: torch.device,
+    batch_size: int = 4,
+    seq_len: int = 128,
+    seed: int = 0,
+) -> dict[str, float]:
+    """Compare FP16 linear output vs packed TorchLinear on random activations."""
+    generator = torch.Generator(device=device)
+    generator.manual_seed(seed)
+    x = torch.randn(batch_size, seq_len, fp16_module.in_features, device=device, generator=generator)
+    x = x.to(dtype=next(fp16_module.parameters()).dtype)
+
+    fp16_out = torch.nn.functional.linear(x, fp16_module.weight, fp16_module.bias)
+    quant_out = quant_module(x)
+
+    diff = (fp16_out - quant_out).abs()
+    denom = fp16_out.abs().mean().clamp(min=1e-6)
+    return {
+        "mse": float(torch.mean((fp16_out - quant_out) ** 2).item()),
+        "mean_abs_error": float(diff.mean().item()),
+        "max_abs_error": float(diff.max().item()),
+        "mean_rel_error": float((diff.mean() / denom).item()),
+    }
+
+
 def summarize_quant_log(
     quantize_result: dict[str, list[dict[str, str]]],
     *,

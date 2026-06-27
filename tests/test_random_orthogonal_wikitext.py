@@ -19,9 +19,14 @@ if str(ROOT) not in sys.path:
 
 from gptqmodel import BACKEND, GPTQModel, QuantizeConfig  # noqa: E402
 from gptqmodel.utils.moe_benchmark import benchmark_quantize_load_kwargs, configure_moe_quantize_config  # noqa: E402
+from gptqmodel.utils.random_orthogonal_diag import (  # noqa: E402
+    audit_quant_kernel_types,
+    compare_inmem_reload_dequant,
+)
 from gptqmodel.utils.wikitext_benchmark import (  # noqa: E402
     compute_logits_relative_error,
     compute_wikitext_perplexity,
+    compute_wikitext_perplexity_detailed,
     load_wikitext_calibration,
 )
 
@@ -165,26 +170,41 @@ def test_identity_quant_ppl_within_loose_fp16_factor(tmp_path: Path):
         calibration_concat_size=512,
     )
 
-    ppl_pre_reload = compute_wikitext_perplexity(
+    ppl_pre_detail = compute_wikitext_perplexity_detailed(
         model,
         model.tokenizer,
         eval_device,
         seq_len=_EVAL_SEQ_LEN,
         n_tokens=_EVAL_N_TOKENS,
     )
+    ppl_pre_reload = ppl_pre_detail.perplexity
+    kernel_pre = audit_quant_kernel_types(model.model)
+    assert kernel_pre.marlin_linear == 0
+    assert kernel_pre.torch_linear > 0
 
     quantized_dir = tmp_path / "quantized-identity"
     model.save(str(quantized_dir))
-    del model
 
     reloaded = GPTQModel.load(str(quantized_dir), backend=BACKEND.TORCH, device="cpu")
-    ppl_post_reload = compute_wikitext_perplexity(
+    dequant_parity = compare_inmem_reload_dequant(model.model, reloaded.model)
+    del model
+    kernel_post = audit_quant_kernel_types(reloaded.model)
+    assert kernel_post.marlin_linear == 0
+    assert kernel_post.torch_linear == kernel_pre.torch_linear
+    assert dequant_parity["all_match"] is True
+
+    ppl_post_detail = compute_wikitext_perplexity_detailed(
         reloaded,
         reloaded.tokenizer,
         eval_device,
         seq_len=_EVAL_SEQ_LEN,
         n_tokens=_EVAL_N_TOKENS,
     )
+    ppl_post_reload = ppl_post_detail.perplexity
+    assert ppl_pre_detail.all_losses_finite, (
+        f"pre-reload loss non-finite in windows {ppl_pre_detail.non_finite_window_indices}"
+    )
+    assert ppl_post_detail.all_losses_finite
 
     prompt = calibration[0][:256]
     baseline.model.eval()

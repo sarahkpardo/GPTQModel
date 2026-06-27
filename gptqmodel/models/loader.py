@@ -64,7 +64,11 @@ from ..utils.importer import (
 from ..utils.inspect import safe_kwargs_call
 from ..utils.logger import setup_logger
 from ..utils.machete import _validate_machete_device_support
-from ..utils.marlin import _marlin_capability_supported, _validate_marlin_device_support
+from ..utils.marlin import (
+    _marlin_capability_supported,
+    _validate_marlin_device_support,
+    marlin_runtime_available,
+)
 from ..utils.model import (
     auto_dtype,
     convert_gptq_v1_to_v2_format,
@@ -313,6 +317,26 @@ def _coerce_quantized_awq_dtype(*, backend: BACKEND, qcfg: QuantizeConfig, dtype
 
     log.info(f"Loading Quantized Model: Auto fix `dtype` to `torch.float16` for `{qlinear.__name__}`")
     return torch.float16
+
+
+def _coerce_quantized_gptq_marlin_dtype(*, backend: BACKEND, qcfg: QuantizeConfig, dtype):
+    """Coerce bf16 to fp16 when only the Marlin fp16 runtime is available."""
+    if qcfg.quant_method != METHOD.GPTQ:
+        return dtype
+    if backend not in (BACKEND.GPTQ_MARLIN, BACKEND.AUTO):
+        return dtype
+    if not isinstance(dtype, torch.dtype) or dtype != torch.bfloat16:
+        return dtype
+
+    if marlin_runtime_available(torch.bfloat16):
+        return dtype
+    if marlin_runtime_available(torch.float16):
+        log.info(
+            "Loading Quantized Model: Auto fix `dtype` to `torch.float16` for GPTQ Marlin "
+            "(bf16 runtime unavailable)."
+        )
+        return torch.float16
+    return dtype
 
 
 def check_versions(model_class, requirements: List[str]):
@@ -1010,6 +1034,7 @@ def ModelLoader(cls):
             dtype = torch.float16
 
         dtype = _coerce_quantized_awq_dtype(backend=backend, qcfg=qcfg, dtype=dtype)
+        dtype = _coerce_quantized_gptq_marlin_dtype(backend=backend, qcfg=qcfg, dtype=dtype)
 
         # inject adapter into qcfg
         if adapter is not None:
@@ -1545,6 +1570,12 @@ def ModelLoader(cls):
             # GPTQ Marlin and AWQ Marlin support fp16 and bf16 compute on Ampere+.
             if backend == BACKEND.GPTQ_MARLIN and dtype not in (torch.float16, torch.bfloat16):
                 raise ValueError("Marlin kernel requires dtype=torch.float16 or dtype=torch.bfloat16.")
+            if backend == BACKEND.GPTQ_MARLIN and dtype == torch.bfloat16:
+                dtype = _coerce_quantized_gptq_marlin_dtype(
+                    backend=backend,
+                    qcfg=qcfg,
+                    dtype=dtype,
+                )
             if backend == BACKEND.AWQ_MARLIN and dtype not in (torch.float16, torch.bfloat16):
                 raise ValueError("AWQ Marlin kernel requires dtype=torch.float16 or dtype=torch.bfloat16.")
 

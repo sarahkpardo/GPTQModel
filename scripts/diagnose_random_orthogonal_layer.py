@@ -54,6 +54,7 @@ from gptqmodel.utils.random_orthogonal_diag import (  # noqa: E402
     LayerDiagResult,
     audit_ptq_hooks,
     measure_activation_drift,
+    measure_identity_torchlinear_mse,
     run_layer_pipeline,
     summarize_quant_log,
 )
@@ -388,14 +389,98 @@ def run_full_model_audit(
     }
 
 
+def run_identity_layer_mse_diag(
+    *,
+    model_id: str,
+    module_name: str,
+    calibration,
+    bits: int,
+    group_size: int,
+    device: str,
+    damp_percent: float,
+    trust_remote_code: bool,
+    calib_concat_size: int,
+) -> dict[str, object]:
+    """Quantize with identity GPTQ and compare FP16 vs TorchLinear on one layer."""
+    from gptqmodel.nn_modules.qlinear.torch import TorchLinear
+
+    moe_kwargs = benchmark_quantize_load_kwargs(model_id, trust_remote_code=trust_remote_code)
+    qcfg = _build_qcfg(
+        bits=bits,
+        group_size=group_size,
+        device=device,
+        damp_percent=damp_percent,
+        inference_precision="float16",
+        model_id=model_id,
+        trust_remote_code=trust_remote_code,
+    )
+    load_kwargs: dict[str, object] = {"quantize_config": qcfg, "backend": BACKEND.TORCH}
+    if trust_remote_code:
+        load_kwargs["trust_remote_code"] = True
+
+    fp16_model = GPTQModel.load(model_id, **load_kwargs)
+    configure_moe_quantize_config(fp16_model, fp16_model.quantize_config)
+    fp16_module = _resolve_module(fp16_model, module_name)
+    fp16_full_name = next(name for name, mod in fp16_model.named_modules() if mod is fp16_module)
+    fp16_weight = fp16_module.weight.detach().clone()
+    fp16_bias = fp16_module.bias.detach().clone() if fp16_module.bias is not None else None
+
+    quant_model = GPTQModel.load(model_id, **load_kwargs)
+    configure_moe_quantize_config(quant_model, quant_model.quantize_config)
+    quantize_kwargs = {"batch_size": 1, "backend": BACKEND.TORCH, "calibration_data_min_length": 10}
+    if calib_concat_size > 0:
+        quantize_kwargs["calibration_concat_size"] = calib_concat_size
+    quant_model.quantize(calibration, **quantize_kwargs)
+
+    quant_module = quant_model.model.get_submodule(fp16_full_name)
+    if not isinstance(quant_module, TorchLinear):
+        raise RuntimeError(
+            f"Expected TorchLinear at {fp16_full_name}, got {type(quant_module).__name__}"
+        )
+
+    device_obj = torch.device(device)
+    if next(quant_model.model.parameters()).device != device_obj:
+        quant_model.to(device_obj)
+
+    reference_linear = nn.Linear(
+        fp16_module.in_features,
+        fp16_module.out_features,
+        bias=fp16_bias is not None,
+        device=device_obj,
+        dtype=fp16_weight.dtype,
+    )
+    reference_linear.weight.data = fp16_weight.to(device_obj)
+    if fp16_bias is not None:
+        reference_linear.bias.data = fp16_bias.to(device_obj)
+
+    mse_stats = measure_identity_torchlinear_mse(
+        reference_linear,
+        quant_module,
+        device=device_obj,
+    )
+
+    return {
+        "module": fp16_full_name,
+        "device": str(device_obj),
+        "kernel": type(quant_module).__name__,
+        "identity_layer_mse": mse_stats,
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Diagnose random_orthogonal PTQ regressions.")
     parser.add_argument("--model-id", required=True)
     parser.add_argument("--module-name", default=None, help="Single Linear module to compare.")
     parser.add_argument(
         "--mode",
-        choices=("single_module", "full_audit", "both"),
+        choices=("single_module", "full_audit", "identity_layer_mse", "both"),
         default="both",
+    )
+    parser.add_argument(
+        "--weight-prepare",
+        default="random_orthogonal",
+        choices=("identity", "random_orthogonal"),
+        help="Transform for full_audit mode (identity_layer_mse always uses identity).",
     )
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--bits", type=int, default=4)
@@ -431,8 +516,8 @@ def main() -> int:
     )
 
     module_name = args.module_name
-    if module_name is None and args.mode in {"single_module", "both"}:
-        module_name = "model.model.layers.0.self_attn.q_proj"
+    if module_name is None and args.mode in {"single_module", "both", "identity_layer_mse"}:
+        module_name = "model.layers.0.self_attn.q_proj"
 
     probe_modules = [part.strip() for part in args.probe_modules.split(",") if part.strip()]
     if not probe_modules and args.mode in {"full_audit", "both"}:
@@ -446,7 +531,31 @@ def main() -> int:
         "model_id": args.model_id,
         "damp_percent": args.damp_percent,
         "inference_precision": args.inference_precision,
+        "weight_prepare": args.weight_prepare,
     }
+
+    if args.mode == "identity_layer_mse":
+        assert module_name is not None
+        print(f"Identity layer MSE diagnosis: {module_name}")
+        identity_layer = run_identity_layer_mse_diag(
+            model_id=args.model_id,
+            module_name=module_name,
+            calibration=calibration,
+            bits=args.bits,
+            group_size=args.group_size,
+            device=args.device,
+            damp_percent=args.damp_percent,
+            trust_remote_code=args.trust_remote_code,
+            calib_concat_size=args.calib_concat_size,
+        )
+        report["identity_layer_mse"] = identity_layer
+        print(json.dumps(identity_layer, indent=2))
+        if args.output_json is not None:
+            args.output_json.parent.mkdir(parents=True, exist_ok=True)
+            with args.output_json.open("w", encoding="utf-8") as handle:
+                json.dump(report, handle, indent=2)
+            print(f"\nWrote {args.output_json}")
+        return 0
 
     if args.mode in {"single_module", "both"}:
         assert module_name is not None
@@ -465,7 +574,9 @@ def main() -> int:
         report["single_module"] = single
         print(json.dumps(single, indent=2))
 
-    for prepare in ("identity", "random_orthogonal"):
+    for prepare in (
+        ("identity", "random_orthogonal") if args.mode == "both" else (args.weight_prepare,)
+    ):
         if args.mode not in {"full_audit", "both"}:
             break
         print(f"\nFull-model audit ({prepare})")

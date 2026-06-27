@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Union
 
 import torch
@@ -140,8 +141,19 @@ def load_wikitext_calibration(
     return packed
 
 
+@dataclass
+class PerplexityEvalResult:
+    """WikiText perplexity with per-window loss diagnostics."""
+
+    perplexity: float
+    n_windows: int
+    all_losses_finite: bool
+    non_finite_window_indices: list[int] = field(default_factory=list)
+    mean_loss: float | None = None
+
+
 @torch.no_grad()
-def compute_wikitext_perplexity(
+def compute_wikitext_perplexity_detailed(
     model: Union[nn.Module, Any],
     tokenizer: PreTrainedTokenizerBase,
     device: torch.device,
@@ -149,12 +161,16 @@ def compute_wikitext_perplexity(
     seq_len: int = 2048,
     n_tokens: int = 2048 * 32,
     split: str = "test",
-) -> float:
-    """Compute WikiText-2 split perplexity using sliding windows of ``seq_len`` tokens."""
+) -> PerplexityEvalResult:
+    """Compute WikiText-2 PPL and report non-finite window losses."""
     try:
         load_dataset = _load_dataset()
     except ImportError:
-        return float("nan")
+        return PerplexityEvalResult(
+            perplexity=float("nan"),
+            n_windows=0,
+            all_losses_finite=False,
+        )
 
     data = load_dataset(WIKITEXT_DATASET, WIKITEXT_CONFIG, split=split)
 
@@ -168,7 +184,11 @@ def compute_wikitext_perplexity(
 
     max_seqs = n_tokens // effective_seq_len
     if max_seqs <= 0:
-        return float("nan")
+        return PerplexityEvalResult(
+            perplexity=float("nan"),
+            n_windows=0,
+            all_losses_finite=False,
+        )
 
     seqs = _iter_wikitext_sequences(
         tokenizer,
@@ -177,16 +197,53 @@ def compute_wikitext_perplexity(
         max_seqs=max_seqs,
     )
     if not seqs:
-        return float("nan")
+        return PerplexityEvalResult(
+            perplexity=float("nan"),
+            n_windows=0,
+            all_losses_finite=False,
+        )
 
     total_nll = 0.0
-    for seq in seqs:
+    non_finite: list[int] = []
+    for index, seq in enumerate(seqs):
         chunk = seq.unsqueeze(0).to(device)
         with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
             out = module(chunk, labels=chunk)
-        total_nll += out.loss.item()
+        loss_value = out.loss.item()
+        if not math.isfinite(loss_value):
+            non_finite.append(index)
+        total_nll += loss_value
 
-    return math.exp(total_nll / len(seqs))
+    mean_loss = total_nll / len(seqs) if seqs else None
+    ppl = math.exp(mean_loss) if mean_loss is not None and math.isfinite(mean_loss) else float("nan")
+    return PerplexityEvalResult(
+        perplexity=ppl,
+        n_windows=len(seqs),
+        all_losses_finite=len(non_finite) == 0,
+        non_finite_window_indices=non_finite,
+        mean_loss=mean_loss,
+    )
+
+
+@torch.no_grad()
+def compute_wikitext_perplexity(
+    model: Union[nn.Module, Any],
+    tokenizer: PreTrainedTokenizerBase,
+    device: torch.device,
+    *,
+    seq_len: int = 2048,
+    n_tokens: int = 2048 * 32,
+    split: str = "test",
+) -> float:
+    """Compute WikiText-2 split perplexity using sliding windows of ``seq_len`` tokens."""
+    return compute_wikitext_perplexity_detailed(
+        model,
+        tokenizer,
+        device,
+        seq_len=seq_len,
+        n_tokens=n_tokens,
+        split=split,
+    ).perplexity
 
 
 @torch.no_grad()
