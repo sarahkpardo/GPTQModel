@@ -5,6 +5,8 @@
 from __future__ import annotations
 
 import copy
+import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Sequence
@@ -345,6 +347,7 @@ def compare_inmem_reload_dequant(
     reloaded_model: nn.Module,
     *,
     max_modules: int = 3,
+    module_names: Sequence[str] | None = None,
     rtol: float = 1e-2,
     atol: float = 1e-2,
 ) -> dict[str, object]:
@@ -359,8 +362,13 @@ def compare_inmem_reload_dequant(
         for name, module in inmem_model.named_modules()
         if isinstance(module, TorchLinear)
     ]
+    if module_names is not None:
+        name_set = set(module_names)
+        inmem_modules = [(name, module) for name, module in inmem_modules if name in name_set]
+    elif max_modules >= 0:
+        inmem_modules = inmem_modules[:max_modules]
 
-    for name, inmem_q in inmem_modules[:max_modules]:
+    for name, inmem_q in inmem_modules:
         try:
             reloaded_q = reloaded_model.get_submodule(name)
         except (AttributeError, ModuleNotFoundError) as exc:
@@ -480,6 +488,507 @@ def compare_inmem_reload_dequant_eager(
         result["eager_comparisons"] = comparisons
         result["eager_all_match"] = all(bool(row["match"]) for row in comparisons)
     return result
+
+
+def sample_torchlinear_modules_by_layer(
+    model: nn.Module,
+    *,
+    proj: str = "q_proj",
+    layers_prefix: str = "model.layers",
+) -> list[str]:
+    """Return one ``TorchLinear`` module path per transformer layer (default: q_proj)."""
+    from ..nn_modules.qlinear.torch import TorchLinear
+
+    layer_pattern = re.compile(rf"^{re.escape(layers_prefix)}\.(\d+)\.")
+    layer_to_name: dict[int, str] = {}
+    suffix = f".self_attn.{proj}"
+    for name, module in model.named_modules():
+        if not isinstance(module, TorchLinear):
+            continue
+        match = layer_pattern.match(name)
+        if match is None or not name.endswith(suffix):
+            continue
+        layer_to_name[int(match.group(1))] = name
+    return [layer_to_name[index] for index in sorted(layer_to_name)]
+
+
+def list_torchlinear_module_names(model: nn.Module) -> list[str]:
+    """Return all ``TorchLinear`` module paths in ``named_modules`` order."""
+    from ..nn_modules.qlinear.torch import TorchLinear
+
+    return [name for name, module in model.named_modules() if isinstance(module, TorchLinear)]
+
+
+def _summarize_dequant_compare(result: dict[str, object]) -> dict[str, object]:
+    comparisons = result.get("comparisons") or []
+    mismatches = [row for row in comparisons if not bool(row.get("match"))]
+    first_mismatch = mismatches[0]["module"] if mismatches else None
+    worst_mean_rel_diff = 0.0
+    for row in comparisons:
+        rel = row.get("mean_rel_diff")
+        if isinstance(rel, (int, float)):
+            worst_mean_rel_diff = max(worst_mean_rel_diff, float(rel))
+    return {
+        "modules_compared": result.get("modules_compared", 0),
+        "all_match": result.get("all_match", False),
+        "first_mismatch": first_mismatch,
+        "worst_mean_rel_diff": worst_mean_rel_diff,
+        "mismatch_count": len(mismatches),
+        "mismatches": mismatches[:20],
+        "load_errors": result.get("mismatches", []),
+    }
+
+
+@torch.no_grad()
+def compare_inmem_reload_dequant_layers(
+    inmem_model: nn.Module,
+    reloaded_model: nn.Module,
+    *,
+    all_modules: bool = False,
+    proj: str = "q_proj",
+    rtol: float = 1e-2,
+    atol: float = 1e-2,
+) -> dict[str, object]:
+    """Compare in-memory vs reload dequant parity across layers or all TorchLinear modules."""
+    if all_modules:
+        module_names = list_torchlinear_module_names(inmem_model)
+        tier = "all_modules"
+    else:
+        module_names = sample_torchlinear_modules_by_layer(inmem_model, proj=proj)
+        tier = "per_layer"
+
+    raw = compare_inmem_reload_dequant(
+        inmem_model,
+        reloaded_model,
+        module_names=module_names,
+        max_modules=-1,
+        rtol=rtol,
+        atol=atol,
+    )
+    summary = _summarize_dequant_compare(raw)
+    summary["tier"] = tier
+    summary["module_names_sample"] = module_names[:5]
+    summary["layers_compared"] = len(module_names) if tier == "per_layer" else None
+    summary["modules_compared"] = raw.get("modules_compared", 0)
+    return summary
+
+
+def capture_torchlinear_env_snapshot() -> dict[str, object]:
+    """Snapshot TorchLinear runtime env flags relevant to reload forward audits."""
+
+    def _flag(name: str, default: str = "0") -> bool:
+        return os.environ.get(name, default) not in {"0", "false", "False"}
+
+    return {
+        "gptq_torch_disable_compile": _flag("GPTQ_TORCH_DISABLE_COMPILE"),
+        "gptq_torch_triton_dequant": (
+            None
+            if os.environ.get("GPTQ_TORCH_TRITON_DEQUANT") is None
+            else _flag("GPTQ_TORCH_TRITON_DEQUANT")
+        ),
+        "gptq_torch_streaming": _flag("GPTQ_TORCH_STREAMING"),
+        "gptq_torch_cache_weights": _flag("GPTQ_TORCH_CACHE_WEIGHTS"),
+        "gptq_torch_lookahead": _flag("GPTQ_TORCH_LOOKAHEAD"),
+    }
+
+
+def _tensor_rel_error(reference: torch.Tensor, candidate: torch.Tensor) -> dict[str, float | bool]:
+    ref = reference.float()
+    cand = candidate.float()
+    if ref.shape != cand.shape:
+        return {
+            "mean_rel_error": float("nan"),
+            "max_abs_error": float("nan"),
+            "mean_abs_error": float("nan"),
+            "allclose": False,
+        }
+    diff = (cand - ref).abs()
+    denom = ref.abs().mean().clamp(min=1e-6)
+    return {
+        "mean_rel_error": float(diff.mean().item() / denom.item()),
+        "max_abs_error": float(diff.max().item()),
+        "mean_abs_error": float(diff.mean().item()),
+        "allclose": False,
+    }
+
+
+@torch.no_grad()
+def measure_torchlinear_forward_vs_dequant(
+    module: nn.Module,
+    x: torch.Tensor,
+    *,
+    use_eager_parent: bool = False,
+    rtol: float = 1e-2,
+    atol: float = 1e-2,
+) -> dict[str, object]:
+    """Compare ``TorchLinear.forward`` output vs matmul with dequantized weights."""
+    from ..nn_modules.qlinear.torch import TorchLinear
+
+    if not isinstance(module, TorchLinear):
+        raise TypeError(f"Expected TorchLinear, got {type(module)!r}")
+
+    module.eval()
+    out_fwd = module(x)
+    num_itr = module.g_idx.shape[0] // x.shape[-1]
+    if use_eager_parent:
+        weights = _eager_torchlinear_dequant(module)
+    else:
+        weights = module.dequantize_weight(num_itr=num_itr)
+    weights = weights.to(device=x.device, dtype=x.dtype)
+    x_flat = x.reshape(-1, x.shape[-1])
+    out_dq = torch.matmul(x_flat, weights).reshape(*x.shape[:-1], module.out_features)
+    bias = getattr(module, "bias", None)
+    if bias is not None:
+        out_dq = out_dq + bias.to(device=out_dq.device, dtype=out_dq.dtype)
+
+    stats = _tensor_rel_error(out_fwd, out_dq)
+    stats["allclose"] = bool(torch.allclose(out_fwd, out_dq, rtol=rtol, atol=atol))
+    stats["rtol"] = rtol
+    stats["atol"] = atol
+    stats["use_eager_parent"] = use_eager_parent
+    return stats
+
+
+def _extract_module_input(args: tuple[Any, ...], kwargs: dict[str, Any]) -> torch.Tensor | None:
+    if args and isinstance(args[0], torch.Tensor):
+        return args[0]
+    for key in ("x", "hidden_states", "input"):
+        value = kwargs.get(key)
+        if isinstance(value, torch.Tensor):
+            return value
+    return None
+
+
+@torch.no_grad()
+def capture_torchlinear_inputs(
+    model: nn.Module,
+    module_names: Sequence[str],
+    batch: dict[str, torch.Tensor],
+    *,
+    use_autocast: bool = True,
+) -> dict[str, torch.Tensor]:
+    """Run one forward and capture inputs to selected ``TorchLinear`` modules."""
+    captured: dict[str, torch.Tensor] = {}
+    handles = []
+
+    def _make_hook(name: str):
+        def _hook(_module, args, kwargs):
+            value = _extract_module_input(args, kwargs)
+            if value is not None:
+                captured[name] = value.detach()
+
+        return _hook
+
+    for name in module_names:
+        module = model.get_submodule(name)
+        handles.append(module.register_forward_pre_hook(_make_hook(name), with_kwargs=True))
+
+    model.eval()
+    device = next(model.parameters()).device
+    batch_on_device = {key: value.to(device) for key, value in batch.items()}
+    with torch.amp.autocast("cuda", enabled=use_autocast and device.type == "cuda"):
+        model(**batch_on_device)
+
+    for handle in handles:
+        handle.remove()
+    return captured
+
+
+@torch.no_grad()
+def audit_torchlinear_forward_vs_dequant(
+    model: nn.Module,
+    module_names: Sequence[str],
+    batch: dict[str, torch.Tensor],
+    *,
+    eager: bool = False,
+    rtol: float = 1e-2,
+    atol: float = 1e-2,
+) -> dict[str, object]:
+    """Measure forward-vs-dequant gap for modules using real activations from one forward."""
+    inputs = capture_torchlinear_inputs(model, module_names, batch)
+    per_module: dict[str, object] = {}
+    missing_inputs: list[str] = []
+    for name in module_names:
+        x = inputs.get(name)
+        if x is None:
+            missing_inputs.append(name)
+            continue
+        module = model.get_submodule(name)
+        per_module[name] = measure_torchlinear_forward_vs_dequant(
+            module,
+            x,
+            use_eager_parent=eager,
+            rtol=rtol,
+            atol=atol,
+        )
+
+    rel_errors = [
+        float(row["mean_rel_error"])
+        for row in per_module.values()
+        if isinstance(row, dict) and isinstance(row.get("mean_rel_error"), (int, float))
+    ]
+    worst_module = None
+    worst_rel = 0.0
+    for name, row in per_module.items():
+        if not isinstance(row, dict):
+            continue
+        rel = row.get("mean_rel_error")
+        if isinstance(rel, (int, float)) and float(rel) >= worst_rel:
+            worst_rel = float(rel)
+            worst_module = name
+
+    return {
+        "modules_audited": len(per_module),
+        "missing_inputs": missing_inputs,
+        "worst_mean_rel_error": worst_rel if rel_errors else None,
+        "worst_module": worst_module,
+        "all_match": all(
+            bool(row.get("allclose"))
+            for row in per_module.values()
+            if isinstance(row, dict)
+        )
+        if per_module
+        else False,
+        "per_module": per_module,
+    }
+
+
+@torch.no_grad()
+def compare_forward_vs_dequant_pre_post(
+    inmem_model: nn.Module,
+    reloaded_model: nn.Module,
+    module_names: Sequence[str],
+    batch: dict[str, torch.Tensor],
+    *,
+    eager: bool = False,
+    rtol: float = 1e-2,
+    atol: float = 1e-2,
+) -> dict[str, object]:
+    """Compare forward-vs-dequant gaps before and after reload on the same modules."""
+    pre = audit_torchlinear_forward_vs_dequant(
+        inmem_model,
+        module_names,
+        batch,
+        eager=eager,
+        rtol=rtol,
+        atol=atol,
+    )
+    post = audit_torchlinear_forward_vs_dequant(
+        reloaded_model,
+        module_names,
+        batch,
+        eager=eager,
+        rtol=rtol,
+        atol=atol,
+    )
+    gap_delta: dict[str, float | None] = {}
+    for name in module_names:
+        pre_row = pre.get("per_module", {}).get(name, {})
+        post_row = post.get("per_module", {}).get(name, {})
+        pre_rel = pre_row.get("mean_rel_error") if isinstance(pre_row, dict) else None
+        post_rel = post_row.get("mean_rel_error") if isinstance(post_row, dict) else None
+        if isinstance(pre_rel, (int, float)) and isinstance(post_rel, (int, float)):
+            gap_delta[name] = float(post_rel) - float(pre_rel)
+        else:
+            gap_delta[name] = None
+
+    return {
+        "pre_inmem": pre,
+        "post_reload": post,
+        "gap_delta": gap_delta,
+    }
+
+
+def default_forward_audit_module_names(model: nn.Module) -> list[str]:
+    """Sample modules for forward-vs-dequant audit (layer 0 q/k/v + mid/deep q_proj)."""
+    all_names = set(list_torchlinear_module_names(model))
+    per_layer = sample_torchlinear_modules_by_layer(model, proj="q_proj")
+    names: list[str] = []
+    for suffix in ("q_proj", "k_proj", "v_proj"):
+        candidate = f"model.layers.0.self_attn.{suffix}"
+        if candidate in all_names:
+            names.append(candidate)
+    for index in (4, 13, 27):
+        for name in per_layer:
+            if name.startswith(f"model.layers.{index}."):
+                names.append(name)
+                break
+    if per_layer and per_layer[-1] not in names:
+        names.append(per_layer[-1])
+    return list(dict.fromkeys(names))
+
+
+def default_hidden_state_probe_names(model: nn.Module, *, layers_prefix: str = "model.layers") -> list[str]:
+    """Return decoder-layer probe names at early/mid/deep positions plus final norm."""
+    layer_pattern = re.compile(rf"^{re.escape(layers_prefix)}\.(\d+)$")
+    layer_indices: list[int] = []
+    for name, _module in model.named_modules():
+        match = layer_pattern.match(name)
+        if match is not None:
+            layer_indices.append(int(match.group(1)))
+    layer_indices = sorted(set(layer_indices))
+    picks = [index for index in (0, 4, 13, 27) if index in layer_indices]
+    if layer_indices and layer_indices[-1] not in picks:
+        picks.append(layer_indices[-1])
+    probes = [f"{layers_prefix}.{index}" for index in sorted(set(picks))]
+    norm_name = f"{layers_prefix.rsplit('.', 1)[0]}.norm" if "." in layers_prefix else "model.norm"
+    try:
+        model.get_submodule(norm_name)
+        probes.append(norm_name)
+    except (AttributeError, ModuleNotFoundError):
+        pass
+    return probes
+
+
+@torch.no_grad()
+def capture_probe_activations(
+    model: nn.Module,
+    input_batch: dict[str, torch.Tensor],
+    probe_names: Sequence[str],
+    *,
+    use_autocast: bool = True,
+) -> dict[str, torch.Tensor]:
+    """Capture module outputs for hidden-state probes during one forward."""
+    captured: dict[str, torch.Tensor] = {}
+    handles = []
+
+    def _make_hook(name: str):
+        def _hook(_module, _inp, out):
+            if isinstance(out, torch.Tensor):
+                captured[name] = out.detach()
+            elif isinstance(out, (tuple, list)) and out and isinstance(out[0], torch.Tensor):
+                captured[name] = out[0].detach()
+
+        return _hook
+
+    for name in probe_names:
+        module = model.get_submodule(name)
+        handles.append(module.register_forward_hook(_make_hook(name)))
+
+    model.eval()
+    device = next(model.parameters()).device
+    batch = {key: value.to(device) for key, value in input_batch.items()}
+    with torch.amp.autocast("cuda", enabled=use_autocast and device.type == "cuda"):
+        model(**batch)
+
+    for handle in handles:
+        handle.remove()
+    return captured
+
+
+@torch.no_grad()
+def compare_hidden_states_pre_post(
+    pre_model: nn.Module,
+    post_model: nn.Module,
+    input_batch: dict[str, torch.Tensor],
+    probe_names: Sequence[str],
+    *,
+    threshold: float = 0.05,
+    rtol: float = 1e-2,
+    atol: float = 1e-2,
+) -> dict[str, object]:
+    """Compare hidden-state probe activations between pre-reload and post-reload models."""
+    pre_acts = capture_probe_activations(pre_model, input_batch, probe_names)
+    post_acts = capture_probe_activations(post_model, input_batch, probe_names)
+    probes: dict[str, object] = {}
+    first_diverged_probe = None
+    for name in probe_names:
+        pre = pre_acts.get(name)
+        post = post_acts.get(name)
+        if pre is None or post is None:
+            probes[name] = {
+                "missing_pre": pre is None,
+                "missing_post": post is None,
+                "mean_rel_error": None,
+                "allclose": False,
+            }
+            if first_diverged_probe is None:
+                first_diverged_probe = name
+            continue
+        stats = _tensor_rel_error(pre, post)
+        stats["allclose"] = bool(torch.allclose(pre, post, rtol=rtol, atol=atol))
+        stats["rtol"] = rtol
+        stats["atol"] = atol
+        probes[name] = stats
+        rel = stats["mean_rel_error"]
+        if (
+            first_diverged_probe is None
+            and isinstance(rel, (int, float))
+            and float(rel) > threshold
+        ):
+            first_diverged_probe = name
+
+    all_match = all(
+        isinstance(row, dict) and bool(row.get("allclose"))
+        for row in probes.values()
+    )
+    return {
+        "probes": probes,
+        "first_diverged_probe": first_diverged_probe,
+        "hidden_states_match_pre_post": all_match,
+        "threshold": threshold,
+    }
+
+
+def summarize_reload_forward_audit(
+    *,
+    dequant_per_layer: dict[str, object] | None,
+    dequant_all_modules: dict[str, object] | None,
+    forward_vs_dequant: dict[str, object] | None,
+    hidden_state_pre_vs_post: dict[str, object] | None,
+    device_map_ablation: dict[str, object] | None = None,
+    forward_gap_threshold: float = 0.05,
+    hidden_threshold: float = 0.05,
+) -> dict[str, object]:
+    """Summarize reload forward audit results into at-a-glance verdict fields."""
+    packed_weights_ok = bool(dequant_per_layer and dequant_per_layer.get("all_match"))
+    if dequant_all_modules is not None:
+        packed_weights_ok = packed_weights_ok and bool(dequant_all_modules.get("all_match"))
+
+    pre_fwd = (forward_vs_dequant or {}).get("pre_inmem", {})
+    post_fwd = (forward_vs_dequant or {}).get("post_reload_layerwise", {})
+    if isinstance(pre_fwd, dict):
+        pre_worst = pre_fwd.get("worst_mean_rel_error")
+        forward_matches_dequant_pre = (
+            pre_worst is None or float(pre_worst) <= forward_gap_threshold
+        )
+    else:
+        forward_matches_dequant_pre = None
+    if isinstance(post_fwd, dict):
+        post_worst = post_fwd.get("worst_mean_rel_error")
+        forward_matches_dequant_post = (
+            post_worst is None or float(post_worst) <= forward_gap_threshold
+        )
+    else:
+        forward_matches_dequant_post = None
+
+    hidden_states_match = None
+    first_diverged = None
+    if hidden_state_pre_vs_post is not None:
+        hidden_states_match = bool(hidden_state_pre_vs_post.get("hidden_states_match_pre_post"))
+        first_diverged = hidden_state_pre_vs_post.get("first_diverged_probe")
+
+    ruled_out: list[str] = []
+    if packed_weights_ok:
+        ruled_out.append("layerwise_packed_weight_checkpoint_corruption")
+    if forward_matches_dequant_pre and forward_matches_dequant_post:
+        ruled_out.append("torchlinear_forward_not_equal_dequant_matmul")
+    if hidden_states_match:
+        ruled_out.append("hidden_state_graph_divergence_pre_vs_post")
+
+    flat_fixed = None
+    if device_map_ablation is not None:
+        flat_fixed = device_map_ablation.get("flat_map_fixes_logits_or_ppl")
+
+    return {
+        "packed_weights_ok": packed_weights_ok,
+        "forward_matches_dequant_pre": forward_matches_dequant_pre,
+        "forward_matches_dequant_post": forward_matches_dequant_post,
+        "hidden_states_match_pre_post": hidden_states_match,
+        "first_diverged_probe": first_diverged,
+        "flat_map_ablation_fixes_issue": flat_fixed,
+        "likely_causes_ruled_out": ruled_out,
+    }
 
 
 @torch.no_grad()

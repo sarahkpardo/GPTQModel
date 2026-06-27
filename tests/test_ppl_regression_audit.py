@@ -23,9 +23,17 @@ from gptqmodel.utils.random_orthogonal_diag import (  # noqa: E402
     audit_checkpoint_load_keys,
     audit_quant_kernel_types,
     audit_tied_weight_aliasing,
+    audit_torchlinear_forward_vs_dequant,
+    capture_torchlinear_env_snapshot,
+    compare_hidden_states_pre_post,
     compare_inmem_reload_dequant,
+    compare_inmem_reload_dequant_layers,
     compare_logits_tensors,
+    default_forward_audit_module_names,
     measure_identity_torchlinear_mse,
+    measure_torchlinear_forward_vs_dequant,
+    sample_torchlinear_modules_by_layer,
+    summarize_reload_forward_audit,
 )
 from gptqmodel.utils.model import (  # noqa: E402
     gptqmodel_post_init,
@@ -357,3 +365,201 @@ def test_compare_logits_tensors_reports_delta():
     assert delta["shape_match"] is True
     assert delta["mean_rel_error"] == pytest.approx(0.1, rel=1e-3)
     assert delta["allclose"] is False
+
+
+class _TinyLayerStack(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layers = nn.ModuleList([_TinyDecoderLayer() for _ in range(3)])
+        self.norm = nn.Linear(8, 8, bias=False)
+
+    def forward(self, hidden_states):
+        for layer in self.layers:
+            hidden_states = layer(hidden_states)
+        return self.norm(hidden_states)
+
+
+class _TinyDecoderLayer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.self_attn = nn.ModuleDict(
+            {
+                "q_proj": TorchLinear(
+                    bits=4,
+                    group_size=128,
+                    sym=True,
+                    desc_act=False,
+                    in_features=8,
+                    out_features=8,
+                    bias=False,
+                ),
+                "k_proj": TorchLinear(
+                    bits=4,
+                    group_size=128,
+                    sym=True,
+                    desc_act=False,
+                    in_features=8,
+                    out_features=8,
+                    bias=False,
+                ),
+            }
+        )
+
+    def forward(self, hidden_states):
+        hidden_states = self.self_attn["q_proj"](hidden_states)
+        hidden_states = self.self_attn["k_proj"](hidden_states)
+        return hidden_states
+
+
+class _TinyCausalLM(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.model = _TinyLayerStack()
+
+    def forward(self, input_ids):
+        hidden = torch.zeros(
+            input_ids.shape[0],
+            input_ids.shape[1],
+            8,
+            device=input_ids.device,
+            dtype=torch.float32,
+        )
+        hidden = self.model(hidden)
+        return type("Out", (), {"logits": hidden})()
+
+
+def test_sample_torchlinear_modules_by_layer():
+    model = _TinyCausalLM()
+    names = sample_torchlinear_modules_by_layer(model.model, proj="q_proj", layers_prefix="layers")
+    assert names == [
+        "layers.0.self_attn.q_proj",
+        "layers.1.self_attn.q_proj",
+        "layers.2.self_attn.q_proj",
+    ]
+
+
+def test_compare_inmem_reload_dequant_layers_matches_same_weights():
+    left = _TinyCausalLM()
+    right = _TinyCausalLM()
+    fake = torch.randn(8, 8)
+
+    def _fake_dequant(num_itr=1):
+        del num_itr
+        return fake
+
+    for module in left.modules():
+        if isinstance(module, TorchLinear):
+            module.dequantize_weight = _fake_dequant  # type: ignore[method-assign]
+            module.qweight = torch.empty(0)
+    for module in right.modules():
+        if isinstance(module, TorchLinear):
+            module.dequantize_weight = _fake_dequant  # type: ignore[method-assign]
+            module.qweight = torch.empty(0)
+
+    result = compare_inmem_reload_dequant_layers(left, right)
+    assert result["all_match"] is True
+    assert result["layers_compared"] == 3
+
+
+def test_measure_torchlinear_forward_vs_dequant_with_mocked_paths():
+    module = TorchLinear(
+        bits=4,
+        group_size=128,
+        sym=True,
+        desc_act=False,
+        in_features=8,
+        out_features=8,
+        bias=False,
+    )
+    module.register_buffer("g_idx", torch.zeros(8, dtype=torch.int32))
+    x = torch.randn(2, 3, 8)
+
+    module.forward = lambda inp: inp  # type: ignore[method-assign, assignment]
+    module.dequantize_weight = lambda num_itr=1: torch.eye(8)  # type: ignore[method-assign, assignment]
+
+    stats = measure_torchlinear_forward_vs_dequant(module, x)
+    assert stats["allclose"] is True
+
+
+def test_compare_hidden_states_pre_post_detects_drift():
+    class _SimpleLayer(nn.Module):
+        def forward(self, hidden_states):
+            return hidden_states + 0.1
+
+    class _SimpleStack(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = nn.ModuleList([_SimpleLayer(), _SimpleLayer(), _SimpleLayer()])
+            self.norm = nn.Linear(8, 8, bias=False)
+
+        def forward(self, hidden_states):
+            for layer in self.layers:
+                hidden_states = layer(hidden_states)
+            return self.norm(hidden_states)
+
+    class _SimpleLM(nn.Module):
+        def __init__(self, *, bias: float):
+            super().__init__()
+            self.model = _SimpleStack()
+            self._bias = bias
+
+        def forward(self, input_ids):
+            hidden = torch.full(
+                (input_ids.shape[0], input_ids.shape[1], 8),
+                self._bias,
+                dtype=torch.float32,
+            )
+            hidden = self.model(hidden)
+            return type("Out", (), {"logits": hidden})()
+
+    pre = _SimpleLM(bias=0.0)
+    post = _SimpleLM(bias=1.0)
+    batch = {"input_ids": torch.zeros(1, 4, dtype=torch.long)}
+    probes = ["model.layers.0", "model.layers.2", "model.norm"]
+    result = compare_hidden_states_pre_post(pre, post, batch, probes, threshold=0.01)
+    assert result["hidden_states_match_pre_post"] is False
+    assert result["first_diverged_probe"] is not None
+
+
+def test_summarize_reload_forward_audit_verdict():
+    verdict = summarize_reload_forward_audit(
+        dequant_per_layer={"all_match": True},
+        dequant_all_modules=None,
+        forward_vs_dequant={
+            "pre_inmem": {"worst_mean_rel_error": 0.001},
+            "post_reload_layerwise": {"worst_mean_rel_error": 0.002},
+        },
+        hidden_state_pre_vs_post={
+            "hidden_states_match_pre_post": False,
+            "first_diverged_probe": "model.layers.0",
+        },
+    )
+    assert verdict["packed_weights_ok"] is True
+    assert verdict["forward_matches_dequant_pre"] is True
+    assert verdict["forward_matches_dequant_post"] is True
+    assert verdict["hidden_states_match_pre_post"] is False
+    assert "layerwise_packed_weight_checkpoint_corruption" in verdict["likely_causes_ruled_out"]
+
+
+def test_capture_torchlinear_env_snapshot_reads_flags(monkeypatch):
+    monkeypatch.setenv("GPTQ_TORCH_DISABLE_COMPILE", "1")
+    monkeypatch.setenv("GPTQ_TORCH_TRITON_DEQUANT", "0")
+    snapshot = capture_torchlinear_env_snapshot()
+    assert snapshot["gptq_torch_disable_compile"] is True
+    assert snapshot["gptq_torch_triton_dequant"] is False
+
+
+def test_default_forward_audit_module_names_includes_layer_zero():
+    model = _TinyCausalLM()
+    names = default_forward_audit_module_names(model)
+    assert "model.layers.0.self_attn.q_proj" in names
+    assert "model.layers.0.self_attn.k_proj" in names
+
+
+def test_audit_reload_forward_script_imports():
+    script_path = ROOT / "scripts" / "audit_reload_forward.py"
+    spec = importlib.util.spec_from_file_location("audit_reload_forward", script_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    assert hasattr(module, "main")
