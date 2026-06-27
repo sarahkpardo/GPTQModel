@@ -54,6 +54,7 @@ from gptqmodel.utils.random_orthogonal_diag import (  # noqa: E402
     clear_torchlinear_inference_state,
     compare_inmem_reload_dequant_eager,
     resolve_model_param_dtype,
+    sample_torchlinear_qweight_device,
     summarize_quant_log,
 )
 from gptqmodel.utils.wikitext_benchmark import (  # noqa: E402
@@ -326,8 +327,8 @@ def _run_method(
         )
 
     print(f"Evaluating post-reload PPL ({weight_prepare})...")
-    post_reload_eval_device = next(reloaded.model.parameters()).device
-    print(f"PPL eval device: {post_reload_eval_device}")
+    post_reload_eval_device = _prepare_model_for_ppl_eval(reloaded, eval_device)
+    quant_buffer_device_post = sample_torchlinear_qweight_device(reloaded.model)
     post_detail = compute_wikitext_perplexity_detailed(
         reloaded,
         reloaded.tokenizer,
@@ -374,6 +375,7 @@ def _run_method(
         ),
         "pre_reload_eval_device": str(pre_reload_eval_device) if pre_reload_eval_device is not None else None,
         "post_reload_eval_device": str(post_reload_eval_device),
+        "quant_buffer_device_post_reload": quant_buffer_device_post,
         "eval_param_dtype_pre_reload": eval_param_dtype_pre,
         "eval_param_dtype_post_reload": eval_param_dtype_post,
         "reload_backend": reload_backend_label,

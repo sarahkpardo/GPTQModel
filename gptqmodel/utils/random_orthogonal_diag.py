@@ -73,6 +73,18 @@ def resolve_model_param_dtype(model: nn.Module) -> str:
     return "unknown"
 
 
+def sample_torchlinear_qweight_device(model: nn.Module) -> str | None:
+    """Return the device string of the first TorchLinear qweight buffer, if any."""
+    from ..nn_modules.qlinear.torch import TorchLinear
+
+    for module in model.modules():
+        if isinstance(module, TorchLinear):
+            qweight = getattr(module, "qweight", None)
+            if isinstance(qweight, torch.Tensor):
+                return str(qweight.device)
+    return None
+
+
 def audit_quant_kernel_types(model: nn.Module, *, sample_limit: int = 5) -> KernelTypeAudit:
     """Count quant kernel module types in a model graph."""
     from ..nn_modules.qlinear import BaseQuantLinear

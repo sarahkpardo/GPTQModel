@@ -27,6 +27,7 @@ from gptqmodel.utils.random_orthogonal_diag import (  # noqa: E402
 from gptqmodel.utils.model import (  # noqa: E402
     gptqmodel_post_init,
     maybe_convert_gptq_v1_to_v2_runtime,
+    sync_quant_linear_runtime_devices,
 )
 from gptqmodel.utils.wikitext_benchmark import compute_wikitext_perplexity_detailed  # noqa: E402
 
@@ -271,3 +272,32 @@ def test_maybe_convert_gptq_v1_to_v2_runtime_skips_already_v2():
 
     assert module.qzero_format() == 2
     assert torch.equal(module.qzeros.data, v2_qzeros)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for device sync test")
+def test_sync_quant_linear_runtime_devices_moves_buffers_to_parent_cuda():
+    quant = TorchLinear(
+        bits=4,
+        group_size=128,
+        sym=True,
+        desc_act=False,
+        in_features=32,
+        out_features=16,
+        bias=False,
+    )
+    quant.register_buffer("qweight", torch.zeros(4, 16, dtype=torch.int32, device="cpu"))
+    quant.register_buffer("qzeros", torch.zeros(1, 16, dtype=torch.int32, device="cpu"))
+    quant.register_buffer("scales", torch.ones(1, 16, dtype=torch.float16, device="cpu"))
+    quant.register_buffer("g_idx", torch.zeros(32, dtype=torch.int32, device="cpu"))
+    quant.qzero_format(format=2)
+
+    layer = nn.Module()
+    layer.norm = nn.Linear(32, 16, bias=False).cuda()
+    layer.q_proj = quant
+
+    parent = nn.Module()
+    parent.layer = layer
+
+    moved = sync_quant_linear_runtime_devices(parent)
+    assert moved == 1
+    assert quant.qweight.device.type == "cuda"

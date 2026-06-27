@@ -1240,6 +1240,58 @@ def maybe_convert_gptq_v2_to_v1_export(
     return True
 
 
+def _floating_param_device(module: nn.Module) -> Optional[torch.device]:
+    for param in module.parameters():
+        if param.is_floating_point():
+            return param.device
+    return None
+
+
+def _resolve_quant_module_target_device(model: nn.Module, module_name: str) -> Optional[torch.device]:
+    """Pick the compute device for a quant linear from its parent block."""
+    target = None
+    if module_name:
+        parts = module_name.split(".")
+        for depth in range(len(parts) - 1, 0, -1):
+            ancestor_name = ".".join(parts[:depth])
+            try:
+                ancestor = get_module_by_name(model, ancestor_name)
+            except ValueError:
+                continue
+            target = _floating_param_device(ancestor)
+            if target is not None:
+                return target
+    return _floating_param_device(model)
+
+
+def sync_quant_linear_runtime_devices(model: nn.Module) -> int:
+    """Move REQUIRES_FORMAT_V2 quant buffers onto their parent block compute device."""
+    moved = 0
+    for name, submodule in model.named_modules():
+        if not isinstance(submodule, BaseQuantLinear):
+            continue
+        if not getattr(submodule, "REQUIRES_FORMAT_V2", False):
+            continue
+
+        buffers = submodule.list_buffers()
+        if not buffers:
+            continue
+
+        target = _resolve_quant_module_target_device(model, name)
+        if target is None:
+            continue
+        if buffers[0].device == target:
+            continue
+
+        submodule.to(device=target)
+        if hasattr(submodule, "clear_weight_cache"):
+            submodule.clear_weight_cache()
+        if hasattr(submodule, "_stream_reset_cache"):
+            submodule._stream_reset_cache()
+        moved += 1
+    return moved
+
+
 # public/stable api exposed to transformer/optimum
 def hf_gptqmodel_post_init(model, use_act_order: bool, quantize_config: QuantizeConfig = None,
                         max_input_length: Optional[int] = None):
@@ -1252,6 +1304,9 @@ def gptqmodel_post_init(model, use_act_order: bool, quantize_config: QuantizeCon
     Initialize model-persistent backend scratch buffers after quantized weights are loaded.
     """
     maybe_convert_gptq_v1_to_v2_runtime(model, quantize_config)
+    synced = sync_quant_linear_runtime_devices(model)
+    if synced:
+        log.info(f"Format: Synced quant buffer devices for {synced} REQUIRES_FORMAT_V2 module(s).")
 
     fixed_bytes = {}
     model_uses_exllamav2 = False

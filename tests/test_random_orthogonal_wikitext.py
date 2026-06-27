@@ -23,6 +23,7 @@ from gptqmodel.utils.random_orthogonal_diag import (  # noqa: E402
     audit_quant_kernel_types,
     compare_inmem_reload_dequant,
     compare_inmem_reload_dequant_eager,
+    sample_torchlinear_qweight_device,
 )
 from gptqmodel.utils.wikitext_benchmark import (  # noqa: E402
     compute_logits_relative_error,
@@ -194,6 +195,10 @@ def test_identity_quant_ppl_within_loose_fp16_factor(tmp_path: Path):
     assert kernel_post.torch_linear == kernel_pre.torch_linear
     assert dequant_parity["all_match"] is True
 
+    qweight_device = sample_torchlinear_qweight_device(reloaded.model)
+    assert qweight_device is not None
+    assert qweight_device.split(":")[0] == eval_device.type
+
     ppl_post_detail = compute_wikitext_perplexity_detailed(
         reloaded,
         reloaded.tokenizer,
@@ -206,6 +211,12 @@ def test_identity_quant_ppl_within_loose_fp16_factor(tmp_path: Path):
         f"pre-reload loss non-finite in windows {ppl_pre_detail.non_finite_window_indices}"
     )
     assert ppl_post_detail.all_losses_finite
+
+    reload_ppl_ratio = abs(ppl_post_reload - ppl_pre_reload) / max(ppl_pre_reload, 1e-6)
+    assert reload_ppl_ratio < 0.25, (
+        f"post-reload PPL {ppl_post_reload:.4f} diverged from pre-reload "
+        f"{ppl_pre_reload:.4f} (ratio={reload_ppl_ratio:.4f})"
+    )
 
     prompt = calibration[0][:256]
     baseline.model.eval()

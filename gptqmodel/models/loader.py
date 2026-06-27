@@ -1504,6 +1504,12 @@ def ModelLoader(cls):
 
                 load_ptq_inference_buffers_from_checkpoint(model, model_save_name)
 
+            # TorchLinear stores qweight/qzeros/scales as buffers; offload_buffers=True
+            # leaves them on CPU while float weights move to GPU, breaking CUDA inference.
+            keep_quant_buffers_on_device = (
+                format_code == FORMAT.GPTQ
+                and getattr(preload_qlinear_kernel, "REQUIRES_FORMAT_V2", False)
+            )
             load_checkpoint_in_model_then_tie_weights(
                 model,
                 dtype=dtype,
@@ -1511,7 +1517,7 @@ def ModelLoader(cls):
                 checkpoint=model_save_name,
                 device_map=device_map,
                 offload_state_dict=True,
-                offload_buffers=True,
+                offload_buffers=not keep_quant_buffers_on_device,
             )
 
             load_checkpoint_in_model = False
