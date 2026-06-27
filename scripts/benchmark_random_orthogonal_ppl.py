@@ -122,6 +122,25 @@ def _count_quant_linear_modules(model: GPTQModel) -> int:
     return sum(1 for module in model.model.modules() if isinstance(module, BaseQuantLinear))
 
 
+def _resolve_eval_device(device: str) -> torch.device:
+    """Return the benchmark evaluation device from the CLI ``--device`` flag."""
+    return torch.device(device)
+
+
+def _prepare_model_for_ppl_eval(model: GPTQModel, eval_device: torch.device) -> torch.device:
+    """Move a freshly quantized model onto the eval device before PPL measurement."""
+    current = next(model.model.parameters()).device
+    if current != eval_device:
+        print(
+            f"PPL eval: moving in-memory model from {current} to {eval_device} "
+            "(quantize finalize leaves modules on CPU)."
+        )
+        model.to(eval_device)
+    actual = next(model.model.parameters()).device
+    print(f"PPL eval device: {actual}")
+    return actual
+
+
 def _resolve_logits_prompt(calibration: list[str]) -> str:
     for sample in calibration:
         stripped = sample.strip()
@@ -151,6 +170,8 @@ def _run_method(
     calib_concat_size: int,
     eval_seq_len: int,
     eval_n_tokens: int,
+    eval_n_tokens_pre_reload: int | None,
+    skip_pre_reload_ppl: bool,
     work_dir: Path,
     trust_remote_code: bool,
     damp_percent: float,
@@ -198,18 +219,28 @@ def _run_method(
     log_summary = summarize_quant_log(quant_result, base_damp=damp_percent)
     avg_loss = log_summary.mean_loss
 
-    eval_device = next(model.model.parameters()).device
+    eval_device = _resolve_eval_device(device)
     quant_linear_pre_reload = _count_quant_linear_modules(model)
     hook_audit_pre_reload = audit_ptq_hooks(model.model)
 
-    print(f"Evaluating in-memory PPL ({weight_prepare})...")
-    ppl_pre_reload = compute_wikitext_perplexity(
-        model,
-        model.tokenizer,
-        eval_device,
-        seq_len=eval_seq_len,
-        n_tokens=eval_n_tokens,
-    )
+    ppl_pre_reload: float | None = None
+    pre_reload_eval_device: torch.device | None = None
+    if not skip_pre_reload_ppl:
+        pre_reload_eval_device = _prepare_model_for_ppl_eval(model, eval_device)
+        pre_reload_n_tokens = eval_n_tokens_pre_reload or eval_n_tokens
+        print(
+            f"Evaluating in-memory PPL ({weight_prepare}) "
+            f"on {pre_reload_eval_device} ({pre_reload_n_tokens} tokens)..."
+        )
+        ppl_pre_reload = compute_wikitext_perplexity(
+            model,
+            model.tokenizer,
+            pre_reload_eval_device,
+            seq_len=eval_seq_len,
+            n_tokens=pre_reload_n_tokens,
+        )
+    else:
+        print(f"Skipping in-memory PPL ({weight_prepare}); --skip-pre-reload-ppl set.")
 
     output_dir = work_dir / f"quantized-{weight_prepare}"
     if output_dir.exists():
@@ -236,10 +267,12 @@ def _run_method(
         )
 
     print(f"Evaluating post-reload PPL ({weight_prepare})...")
+    post_reload_eval_device = next(reloaded.model.parameters()).device
+    print(f"PPL eval device: {post_reload_eval_device}")
     ppl_post_reload = compute_wikitext_perplexity(
         reloaded,
         reloaded.tokenizer,
-        eval_device,
+        post_reload_eval_device,
         seq_len=eval_seq_len,
         n_tokens=eval_n_tokens,
     )
@@ -251,7 +284,7 @@ def _run_method(
             reloaded.tokenizer,
             logits_prompt,
             reference_logits,
-            eval_device,
+            post_reload_eval_device,
         )
 
     del reloaded
@@ -262,7 +295,13 @@ def _run_method(
         "perplexity": ppl_post_reload,
         "ppl_pre_reload": ppl_pre_reload,
         "ppl_post_reload": ppl_post_reload,
-        "ppl_reload_delta": ppl_post_reload - ppl_pre_reload,
+        "ppl_reload_delta": (
+            (ppl_post_reload - ppl_pre_reload)
+            if isinstance(ppl_pre_reload, float) and isinstance(ppl_post_reload, float)
+            else None
+        ),
+        "pre_reload_eval_device": str(pre_reload_eval_device) if pre_reload_eval_device is not None else None,
+        "post_reload_eval_device": str(post_reload_eval_device),
         "reload_backend": reload_backend_label,
         "mean_quant_loss": avg_loss,
         "max_damp": log_summary.max_damp,
@@ -309,7 +348,8 @@ def _print_table(rows: list[dict[str, object]]) -> None:
     )
     print(
         "Note: PPL pre = in-memory after quantize; PPL post = after save/reload. "
-        "A large delta implicates reload/kernel wiring."
+        "A large delta implicates reload/kernel wiring. "
+        "In-memory eval moves the model to --device (quantize leaves weights on CPU)."
     )
 
 
@@ -330,6 +370,18 @@ def main() -> int:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--eval-seq-len", type=int, default=2048)
     parser.add_argument("--eval-n-tokens", type=int, default=2048 * 32)
+    parser.add_argument(
+        "--eval-n-tokens-pre-reload",
+        type=int,
+        default=None,
+        help="Token budget for in-memory PPL only (default: same as --eval-n-tokens). "
+        "Use a smaller value for a faster reload-isolation check.",
+    )
+    parser.add_argument(
+        "--skip-pre-reload-ppl",
+        action="store_true",
+        help="Skip the in-memory PPL pass (post-reload PPL only).",
+    )
     parser.add_argument(
         "--methods",
         default="identity,random_orthogonal",
@@ -405,7 +457,7 @@ def main() -> int:
     print(f"Calibration: {len(calibration)} WikiText train sample(s).")
 
     results: list[dict[str, object]] = []
-    eval_device = next(baseline_model.model.parameters()).device
+    eval_device = _resolve_eval_device(args.device)
     logits_prompt = _resolve_logits_prompt(calibration)
     reference_logits = None
     if not args.skip_fp16:
@@ -413,6 +465,9 @@ def main() -> int:
 
     if not args.skip_fp16:
         print("\n--- Evaluating FP16 baseline ---")
+        if next(baseline_model.model.parameters()).device != eval_device:
+            baseline_model.to(eval_device)
+        print(f"PPL eval device: {next(baseline_model.model.parameters()).device}")
         fp16_ppl = compute_wikitext_perplexity(
             baseline_model,
             baseline_model.tokenizer,
@@ -455,6 +510,8 @@ def main() -> int:
                 calib_concat_size=args.calib_concat_size,
                 eval_seq_len=args.eval_seq_len,
                 eval_n_tokens=args.eval_n_tokens,
+                eval_n_tokens_pre_reload=args.eval_n_tokens_pre_reload,
+                skip_pre_reload_ppl=args.skip_pre_reload_ppl,
                 work_dir=work_dir,
                 trust_remote_code=args.trust_remote_code,
                 damp_percent=args.damp_percent,
@@ -466,10 +523,11 @@ def main() -> int:
             )
             results.append(row)
             print(
-                f"{row['method']}: pre={row['ppl_pre_reload']:.4f} post={row['ppl_post_reload']:.4f} "
-                f"delta={row['ppl_reload_delta']:.4f} loss={row['mean_quant_loss']} "
+                f"{row['method']}: pre={row.get('ppl_pre_reload', '—')} post={row['ppl_post_reload']:.4f} "
+                f"delta={row.get('ppl_reload_delta', '—')} loss={row['mean_quant_loss']} "
                 f"logits_err={row.get('logits_rel_error_vs_fp16')} "
-                f"hooks={row['t_x_hooks']} reload_backend={row['reload_backend']}"
+                f"hooks={row['t_x_hooks']} reload_backend={row['reload_backend']} "
+                f"pre_dev={row.get('pre_reload_eval_device')} post_dev={row.get('post_reload_eval_device')}"
             )
     finally:
         if cleanup:
@@ -494,6 +552,8 @@ def main() -> int:
                     "inference_precision": args.inference_precision,
                     "legacy_random_orthogonal_damp": args.legacy_random_orthogonal_damp,
                     "legacy_auto_reload_backend": args.legacy_auto_reload_backend,
+                    "skip_pre_reload_ppl": args.skip_pre_reload_ppl,
+                    "eval_n_tokens_pre_reload": args.eval_n_tokens_pre_reload,
                     "logits_prompt": logits_prompt,
                     "results": results,
                 },
