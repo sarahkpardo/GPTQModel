@@ -20,8 +20,11 @@ if str(ROOT) not in sys.path:
 from gptqmodel.nn_modules.qlinear.torch import TorchLinear  # noqa: E402
 from gptqmodel.quantization import FORMAT, METHOD, QuantizeConfig  # noqa: E402
 from gptqmodel.utils.random_orthogonal_diag import (  # noqa: E402
+    audit_checkpoint_load_keys,
     audit_quant_kernel_types,
+    audit_tied_weight_aliasing,
     compare_inmem_reload_dequant,
+    compare_logits_tensors,
     measure_identity_torchlinear_mse,
 )
 from gptqmodel.utils.model import (  # noqa: E402
@@ -301,3 +304,56 @@ def test_sync_quant_linear_runtime_devices_moves_buffers_to_parent_cuda():
     moved = sync_quant_linear_runtime_devices(parent)
     assert moved == 1
     assert quant.qweight.device.type == "cuda"
+
+
+class _TiedTinyModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.config = type("Cfg", (), {"tie_word_embeddings": True})()
+        self.embed_tokens = nn.Embedding(32, 8)
+        self.lm_head = nn.Linear(8, 32, bias=False)
+        self.lm_head.weight = self.embed_tokens.weight
+
+
+class _UntiedTinyModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.config = type("Cfg", (), {"tie_word_embeddings": False})()
+        self.embed_tokens = nn.Embedding(32, 8)
+        self.lm_head = nn.Linear(8, 32, bias=False)
+
+
+def test_audit_tied_weight_aliasing_detects_shared_storage():
+    audit = audit_tied_weight_aliasing(_TiedTinyModel())
+    assert audit["tie_word_embeddings"] is True
+    assert audit["same_storage"] is True
+    assert audit["aliased_as_expected"] is True
+
+
+def test_audit_tied_weight_aliasing_detects_untied_weights():
+    audit = audit_tied_weight_aliasing(_UntiedTinyModel())
+    assert audit["tie_word_embeddings"] is False
+    assert audit["same_storage"] is False
+    assert audit["max_abs_diff_untied"] is not None
+
+
+def test_audit_checkpoint_load_keys_reports_missing_lm_head(tmp_path):
+    from safetensors.torch import save_file
+
+    model = _UntiedTinyModel()
+    checkpoint = tmp_path / "model.safetensors"
+    save_file({"embed_tokens.weight": model.embed_tokens.weight}, str(checkpoint))
+
+    audit = audit_checkpoint_load_keys(model, tmp_path)
+    assert audit["embed_tokens_weight_in_checkpoint"] is True
+    assert audit["lm_head_weight_in_checkpoint"] is False
+    assert audit["lm_head_weight_missing_from_checkpoint"] is True
+
+
+def test_compare_logits_tensors_reports_delta():
+    pre = torch.ones(1, 4, 8)
+    post = pre + 0.1
+    delta = compare_logits_tensors(pre, post)
+    assert delta["shape_match"] is True
+    assert delta["mean_rel_error"] == pytest.approx(0.1, rel=1e-3)
+    assert delta["allclose"] is False

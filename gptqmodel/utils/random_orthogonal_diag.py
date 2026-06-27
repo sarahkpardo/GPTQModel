@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal, Sequence
 
 import torch
@@ -83,6 +84,213 @@ def sample_torchlinear_qweight_device(model: nn.Module) -> str | None:
             if isinstance(qweight, torch.Tensor):
                 return str(qweight.device)
     return None
+
+
+def _resolve_embedding_modules(
+    model: nn.Module,
+) -> tuple[nn.Module | None, nn.Module | None, str | None, str | None]:
+    """Return input/output embedding modules and their module paths when discoverable."""
+    input_embed = None
+    output_embed = None
+    input_name = None
+    output_name = None
+
+    if hasattr(model, "get_input_embeddings"):
+        try:
+            input_embed = model.get_input_embeddings()
+        except Exception:
+            input_embed = None
+    if hasattr(model, "get_output_embeddings"):
+        try:
+            output_embed = model.get_output_embeddings()
+        except Exception:
+            output_embed = None
+
+    for name, module in model.named_modules():
+        weight = getattr(module, "weight", None)
+        if not isinstance(weight, torch.Tensor):
+            continue
+        if input_embed is None and name.endswith("embed_tokens"):
+            input_embed = module
+            input_name = name
+        if output_embed is None and name.endswith("lm_head"):
+            output_embed = module
+            output_name = name
+
+    return input_embed, output_embed, input_name, output_name
+
+
+def _tensor_storage_key(tensor: torch.Tensor) -> tuple[int, int]:
+    return (tensor.untyped_storage().data_ptr(), tensor.storage_offset())
+
+
+@torch.no_grad()
+def audit_tied_weight_aliasing(model: nn.Module) -> dict[str, object]:
+    """Audit embed/lm_head aliasing for reload debugging."""
+    config = getattr(model, "config", None)
+    tie_word_embeddings = bool(getattr(config, "tie_word_embeddings", False))
+    input_embed, output_embed, input_name, output_name = _resolve_embedding_modules(model)
+
+    input_weight = getattr(input_embed, "weight", None) if input_embed is not None else None
+    output_weight = getattr(output_embed, "weight", None) if output_embed is not None else None
+
+    same_param_object = (
+        input_weight is not None
+        and output_weight is not None
+        and input_weight is output_weight
+    )
+    same_storage = False
+    if input_weight is not None and output_weight is not None:
+        same_storage = _tensor_storage_key(input_weight) == _tensor_storage_key(output_weight)
+
+    max_abs_diff: float | None = None
+    if (
+        input_weight is not None
+        and output_weight is not None
+        and input_weight.shape == output_weight.shape
+        and not same_storage
+    ):
+        max_abs_diff = float((input_weight - output_weight).abs().max().item())
+
+    tied_keys = getattr(model, "_tied_weights_keys", None)
+    if tied_keys is None:
+        tied_keys_repr: object = None
+    elif isinstance(tied_keys, dict):
+        tied_keys_repr = dict(tied_keys)
+    else:
+        tied_keys_repr = list(tied_keys)
+
+    hf_device_map = getattr(model, "hf_device_map", None)
+
+    return {
+        "tie_word_embeddings": tie_word_embeddings,
+        "input_embed_module": input_name,
+        "output_embed_module": output_name,
+        "input_embed_found": input_embed is not None,
+        "output_embed_found": output_embed is not None,
+        "same_param_object": same_param_object if input_weight is not None and output_weight is not None else None,
+        "same_storage": same_storage if input_weight is not None and output_weight is not None else None,
+        "aliased_as_expected": (
+            same_storage
+            if tie_word_embeddings and input_weight is not None and output_weight is not None
+            else None
+        ),
+        "max_abs_diff_untied": max_abs_diff,
+        "input_weight_shape": list(input_weight.shape) if input_weight is not None else None,
+        "output_weight_shape": list(output_weight.shape) if output_weight is not None else None,
+        "input_weight_device": str(input_weight.device) if input_weight is not None else None,
+        "output_weight_device": str(output_weight.device) if output_weight is not None else None,
+        "tied_weights_keys": tied_keys_repr,
+        "hf_device_map_present": hf_device_map is not None,
+        "hf_device_map_sample": dict(list(hf_device_map.items())[:8]) if isinstance(hf_device_map, dict) else None,
+    }
+
+
+def list_checkpoint_tensor_keys(checkpoint_path: str | Path) -> set[str]:
+    """Return tensor names stored in a GPTQModel checkpoint directory or safetensors file."""
+    from safetensors import safe_open
+
+    path = Path(checkpoint_path)
+    keys: set[str] = set()
+    files: list[Path]
+    if path.is_dir():
+        files = sorted(path.glob("*.safetensors"))
+    elif path.suffix == ".safetensors":
+        files = [path]
+    else:
+        return keys
+
+    for file_path in files:
+        with safe_open(str(file_path), framework="pt", device="cpu") as reader:
+            keys.update(reader.keys())
+    return keys
+
+
+def _model_checkpoint_key_names(model: nn.Module) -> set[str]:
+    names = {name for name, _ in model.named_parameters()}
+    for name, buffer in model.named_buffers():
+        module_path, leaf = name.rsplit(".", 1) if "." in name else ("", name)
+        module = model.get_submodule(module_path) if module_path else model
+        non_persistent = getattr(module, "_non_persistent_buffers_set", set())
+        if leaf in non_persistent:
+            continue
+        names.add(name)
+    return names
+
+
+def audit_checkpoint_load_keys(
+    model: nn.Module,
+    checkpoint_path: str | Path,
+    *,
+    max_list: int = 20,
+) -> dict[str, object]:
+    """Compare checkpoint tensor names against the loaded model state."""
+    checkpoint_keys = list_checkpoint_tensor_keys(checkpoint_path)
+    model_keys = _model_checkpoint_key_names(model)
+    missing_from_checkpoint = sorted(model_keys - checkpoint_keys)
+    unexpected_in_checkpoint = sorted(checkpoint_keys - model_keys)
+
+    def _has_suffix(keys: Sequence[str], suffix: str) -> bool:
+        return any(key == suffix or key.endswith(f".{suffix}") for key in keys)
+
+    embed_keys = [key for key in checkpoint_keys if key.endswith("embed_tokens.weight")]
+    lm_head_keys = [key for key in checkpoint_keys if key.endswith("lm_head.weight")]
+
+    return {
+        "checkpoint_path": str(checkpoint_path),
+        "checkpoint_key_count": len(checkpoint_keys),
+        "model_key_count": len(model_keys),
+        "missing_from_checkpoint_count": len(missing_from_checkpoint),
+        "missing_from_checkpoint_sample": missing_from_checkpoint[:max_list],
+        "unexpected_in_checkpoint_count": len(unexpected_in_checkpoint),
+        "unexpected_in_checkpoint_sample": unexpected_in_checkpoint[:max_list],
+        "embed_tokens_weight_in_checkpoint": bool(embed_keys),
+        "embed_tokens_weight_keys": embed_keys[:max_list],
+        "lm_head_weight_in_checkpoint": bool(lm_head_keys),
+        "lm_head_weight_keys": lm_head_keys[:max_list],
+        "lm_head_weight_missing_from_checkpoint": _has_suffix(missing_from_checkpoint, "lm_head.weight"),
+        "embed_tokens_weight_missing_from_checkpoint": _has_suffix(
+            missing_from_checkpoint,
+            "embed_tokens.weight",
+        ),
+    }
+
+
+@torch.no_grad()
+def compare_logits_tensors(
+    pre_logits: torch.Tensor,
+    post_logits: torch.Tensor,
+    *,
+    rtol: float = 1e-2,
+    atol: float = 1e-2,
+) -> dict[str, object]:
+    """Compare two captured logits tensors (e.g. pre-reload vs post-reload)."""
+    ref = pre_logits.float()
+    cand = post_logits.float()
+    if ref.shape != cand.shape:
+        return {
+            "shape_match": False,
+            "pre_logits_shape": list(pre_logits.shape),
+            "post_logits_shape": list(post_logits.shape),
+            "mean_rel_error": None,
+            "max_abs_error": None,
+            "mean_abs_error": None,
+            "allclose": False,
+        }
+
+    diff = (cand - ref).abs()
+    denom = ref.abs().mean().clamp(min=1e-6)
+    return {
+        "shape_match": True,
+        "pre_logits_shape": list(pre_logits.shape),
+        "post_logits_shape": list(post_logits.shape),
+        "mean_rel_error": float(diff.mean().item() / denom.item()),
+        "max_abs_error": float(diff.max().item()),
+        "mean_abs_error": float(diff.mean().item()),
+        "allclose": bool(torch.allclose(cand, ref, rtol=rtol, atol=atol)),
+        "rtol": rtol,
+        "atol": atol,
+    }
 
 
 def audit_quant_kernel_types(model: nn.Module, *, sample_limit: int = 5) -> KernelTypeAudit:

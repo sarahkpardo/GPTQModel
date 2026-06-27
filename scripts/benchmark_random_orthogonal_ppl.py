@@ -49,10 +49,13 @@ from gptqmodel.utils.moe_benchmark import (  # noqa: E402
     is_moe_gptq_model,
 )
 from gptqmodel.utils.random_orthogonal_diag import (  # noqa: E402
+    audit_checkpoint_load_keys,
     audit_ptq_hooks,
     audit_quant_kernel_types,
+    audit_tied_weight_aliasing,
     clear_torchlinear_inference_state,
     compare_inmem_reload_dequant_eager,
+    compare_logits_tensors,
     resolve_model_param_dtype,
     sample_torchlinear_qweight_device,
     summarize_quant_log,
@@ -205,7 +208,7 @@ def _run_method(
     inference_precision: str,
     legacy_random_orthogonal_damp: bool,
     legacy_auto_reload: bool,
-    logits_prompt: str | None,
+    logits_prompt: str,
     reference_logits: torch.Tensor | None,
 ) -> dict[str, object]:
     moe_load_kwargs = benchmark_quantize_load_kwargs(model_id, trust_remote_code=trust_remote_code)
@@ -255,8 +258,12 @@ def _run_method(
     ppl_pre_reload: float | None = None
     pre_reload_ppl_detail: dict[str, object] | None = None
     pre_reload_eval_device: torch.device | None = None
+    pre_reload_logits: torch.Tensor | None = None
+    tie_weights_pre_reload: dict[str, object] | None = None
     if not skip_pre_reload_ppl:
         pre_reload_eval_device = _prepare_model_for_ppl_eval(model, eval_device)
+        tie_weights_pre_reload = audit_tied_weight_aliasing(model.model)
+        pre_reload_logits = _capture_reference_logits(model, logits_prompt, pre_reload_eval_device)
         pre_reload_n_tokens = eval_n_tokens_pre_reload or eval_n_tokens
         print(
             f"Evaluating in-memory PPL ({weight_prepare}) "
@@ -301,7 +308,10 @@ def _run_method(
     dequant_parity = compare_inmem_reload_dequant_eager(model.model, reloaded.model)
     if not dequant_parity["all_match"]:
         print(f"WARNING: in-memory vs reload dequant mismatch: {dequant_parity['comparisons'][:1]}")
+    tie_weights_pre_reload = tie_weights_pre_reload or audit_tied_weight_aliasing(model.model)
     del model
+
+    reload_load_keys = audit_checkpoint_load_keys(reloaded.model, output_dir)
 
     hook_count = _count_ptq_hooks(reloaded)
     hook_audit = audit_ptq_hooks(reloaded.model)
@@ -323,6 +333,8 @@ def _run_method(
     print(f"Evaluating post-reload PPL ({weight_prepare})...")
     post_reload_eval_device = _prepare_model_for_ppl_eval(reloaded, eval_device)
     quant_buffer_device_post = sample_torchlinear_qweight_device(reloaded.model)
+    tie_weights_post_reload = audit_tied_weight_aliasing(reloaded.model)
+    post_reload_logits = _capture_reference_logits(reloaded, logits_prompt, post_reload_eval_device)
     post_detail = compute_wikitext_perplexity_detailed(
         reloaded,
         reloaded.tokenizer,
@@ -339,7 +351,7 @@ def _run_method(
         )
 
     logits_rel_error = None
-    if logits_prompt and reference_logits is not None:
+    if reference_logits is not None:
         logits_rel_error = compute_logits_relative_error(
             reloaded,
             reloaded.tokenizer,
@@ -347,6 +359,10 @@ def _run_method(
             reference_logits,
             post_reload_eval_device,
         )
+
+    logits_pre_vs_post_reload = None
+    if pre_reload_logits is not None:
+        logits_pre_vs_post_reload = compare_logits_tensors(pre_reload_logits, post_reload_logits)
 
     del reloaded
 
@@ -388,6 +404,10 @@ def _run_method(
         "t_x_buffers_pre_reload": hook_audit_pre_reload.modules_with_t_x_buffers,
         "padded_modules": hook_audit.modules_with_pad[:10],
         "logits_rel_error_vs_fp16": logits_rel_error,
+        "logits_pre_vs_post_reload": logits_pre_vs_post_reload,
+        "tie_weights_pre_reload": tie_weights_pre_reload,
+        "tie_weights_post_reload": tie_weights_post_reload,
+        "reload_load_keys": reload_load_keys,
         "checkpoint": str(output_dir),
     }
 
@@ -395,7 +415,7 @@ def _run_method(
 def _print_table(rows: list[dict[str, object]]) -> None:
     print(
         f"\n{'Method':<28} | {'PPL post':>10} | {'PPL pre':>10} | {'Quant loss':>14} | "
-        f"{'Logits err':>10} | {'T_X hooks':>9}"
+        f"{'Logits Δ':>10} | {'T_X hooks':>9}"
     )
     print("-" * 98)
     for row in rows:
@@ -403,7 +423,11 @@ def _print_table(rows: list[dict[str, object]]) -> None:
         ppl_pre = row.get("ppl_pre_reload", "—")
         loss = row.get("mean_quant_loss")
         hooks = row.get("t_x_hooks", "—")
-        logits_err = row.get("logits_rel_error_vs_fp16")
+        logits_delta = row.get("logits_pre_vs_post_reload")
+        if isinstance(logits_delta, dict):
+            logits_err = logits_delta.get("mean_rel_error")
+        else:
+            logits_err = row.get("logits_rel_error_vs_fp16")
         ppl_str = f"{ppl:.4f}" if isinstance(ppl, float) and math.isfinite(ppl) else "nan"
         ppl_pre_str = (
             f"{ppl_pre:.4f}" if isinstance(ppl_pre, float) and math.isfinite(ppl_pre) else "—"
@@ -598,14 +622,15 @@ def main() -> int:
                 inference_precision=args.inference_precision,
                 legacy_random_orthogonal_damp=args.legacy_random_orthogonal_damp,
                 legacy_auto_reload=args.legacy_auto_reload_backend,
-                logits_prompt=logits_prompt if reference_logits is not None else None,
+                logits_prompt=logits_prompt,
                 reference_logits=reference_logits,
             )
             results.append(row)
             print(
                 f"{row['method']}: pre={row.get('ppl_pre_reload', '—')} post={row['ppl_post_reload']:.4f} "
                 f"delta={row.get('ppl_reload_delta', '—')} loss={row['mean_quant_loss']} "
-                f"logits_err={row.get('logits_rel_error_vs_fp16')} "
+                f"logits_pre_post={row.get('logits_pre_vs_post_reload', {}).get('mean_rel_error')} "
+                f"tie_post={row.get('tie_weights_post_reload', {}).get('aliased_as_expected')} "
                 f"hooks={row['t_x_hooks']} reload_backend={row['reload_backend']} "
                 f"pre_dev={row.get('pre_reload_eval_device')} post_dev={row.get('post_reload_eval_device')}"
             )
