@@ -18,10 +18,15 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from gptqmodel.nn_modules.qlinear.torch import TorchLinear  # noqa: E402
+from gptqmodel.quantization import FORMAT, METHOD, QuantizeConfig  # noqa: E402
 from gptqmodel.utils.random_orthogonal_diag import (  # noqa: E402
     audit_quant_kernel_types,
     compare_inmem_reload_dequant,
     measure_identity_torchlinear_mse,
+)
+from gptqmodel.utils.model import (  # noqa: E402
+    gptqmodel_post_init,
+    maybe_convert_gptq_v1_to_v2_runtime,
 )
 from gptqmodel.utils.wikitext_benchmark import compute_wikitext_perplexity_detailed  # noqa: E402
 
@@ -214,3 +219,55 @@ def test_coerce_quantized_gptq_marlin_dtype(monkeypatch):
         dtype=torch.bfloat16,
     )
     assert coerced == torch.float16
+
+
+def test_gptqmodel_post_init_converts_v1_qzeros_to_v2_runtime():
+    module = TorchLinear(
+        bits=4,
+        group_size=128,
+        sym=True,
+        desc_act=False,
+        in_features=64,
+        out_features=32,
+        bias=False,
+    )
+    module.register_buffer("qweight", torch.zeros(1, 32, dtype=torch.int32))
+    module.register_buffer("qzeros", torch.zeros(1, 32, dtype=torch.int32))
+    module.register_buffer("scales", torch.ones(1, 32, dtype=torch.float16))
+    module.register_buffer("g_idx", torch.zeros(64, dtype=torch.int32))
+    module.qzero_format(format=1)
+    v1_qzeros = module.qzeros.data.clone()
+
+    wrapper = nn.Module()
+    wrapper.layer = module
+    qcfg = QuantizeConfig(bits=4, group_size=128, format=FORMAT.GPTQ, quant_method=METHOD.GPTQ)
+    gptqmodel_post_init(wrapper, use_act_order=False, quantize_config=qcfg)
+
+    assert module.qzero_format() == 2
+    assert not torch.equal(module.qzeros.data, v1_qzeros)
+
+
+def test_maybe_convert_gptq_v1_to_v2_runtime_skips_already_v2():
+    module = TorchLinear(
+        bits=4,
+        group_size=128,
+        sym=True,
+        desc_act=False,
+        in_features=64,
+        out_features=32,
+        bias=False,
+    )
+    module.register_buffer("qweight", torch.zeros(1, 32, dtype=torch.int32))
+    module.register_buffer("qzeros", torch.zeros(1, 32, dtype=torch.int32))
+    module.register_buffer("scales", torch.ones(1, 32, dtype=torch.float16))
+    module.register_buffer("g_idx", torch.zeros(64, dtype=torch.int32))
+    module.qzero_format(format=2)
+    v2_qzeros = module.qzeros.data.clone()
+
+    wrapper = nn.Module()
+    wrapper.layer = module
+    qcfg = QuantizeConfig(bits=4, group_size=128, format=FORMAT.GPTQ, quant_method=METHOD.GPTQ)
+    maybe_convert_gptq_v1_to_v2_runtime(wrapper, qcfg)
+
+    assert module.qzero_format() == 2
+    assert torch.equal(module.qzeros.data, v2_qzeros)

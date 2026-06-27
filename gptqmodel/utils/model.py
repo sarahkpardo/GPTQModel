@@ -1194,6 +1194,52 @@ def simple_dispatch_model(model, device_map):
     return model
 
 
+def maybe_convert_gptq_v1_to_v2_runtime(
+    model: nn.Module,
+    quantize_config: Optional[QuantizeConfig],
+) -> None:
+    """Convert packed GPTQ v1 export qzeros to v2 runtime layout for inference kernels."""
+    if quantize_config is None:
+        return
+    if quantize_config.export_quant_method() != METHOD.GPTQ:
+        return
+    if resolve_quant_format(quantize_config.format, quantize_config.method) != FORMAT.GPTQ:
+        return
+
+    for _, submodule in model.named_modules():
+        if (
+            isinstance(submodule, BaseQuantLinear)
+            and getattr(submodule, "REQUIRES_FORMAT_V2", False)
+            and submodule.qzero_format() == 1
+        ):
+            convert_gptq_v1_to_v2_format_module(
+                module=submodule,
+                bits=quantize_config.bits,
+                pack_dtype=quantize_config.pack_dtype,
+            )
+
+
+def maybe_convert_gptq_v2_to_v1_export(
+    model: nn.Module,
+    quantize_config: QuantizeConfig,
+    qlinear_kernel: Type[BaseQuantLinear],
+) -> bool:
+    """Convert runtime v2 qzeros back to v1 export layout before writing checkpoints."""
+    if quantize_config.export_quant_method() != METHOD.GPTQ:
+        return False
+    if resolve_quant_format(quantize_config.format, quantize_config.method) != FORMAT.GPTQ:
+        return False
+    if not getattr(qlinear_kernel, "REQUIRES_FORMAT_V2", False):
+        return False
+    if not any(
+        isinstance(submodule, qlinear_kernel) and submodule.qzero_format() == 2
+        for submodule in model.modules()
+    ):
+        return False
+    convert_gptq_v2_to_v1_format(model, quantize_config, qlinear_kernel)
+    return True
+
+
 # public/stable api exposed to transformer/optimum
 def hf_gptqmodel_post_init(model, use_act_order: bool, quantize_config: QuantizeConfig = None,
                         max_input_length: Optional[int] = None):
@@ -1205,6 +1251,8 @@ def gptqmodel_post_init(model, use_act_order: bool, quantize_config: QuantizeCon
     """
     Initialize model-persistent backend scratch buffers after quantized weights are loaded.
     """
+    maybe_convert_gptq_v1_to_v2_runtime(model, quantize_config)
+
     fixed_bytes = {}
     model_uses_exllamav2 = False
 

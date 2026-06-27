@@ -49,8 +49,10 @@ from ..utils.hf import (
     suspend_hf_weight_init,
 )
 from ..utils.logger import setup_logger
+from ..nn_modules.qlinear import BaseQuantLinear
 from ..utils.model import (
     TensorSource,
+    convert_gptq_v1_to_v2_format,
     copy_py_files,
     find_modules,
     get_model_files_size,
@@ -58,6 +60,7 @@ from ..utils.model import (
     get_state_dict_for_save,
     load_checkpoint_in_model_then_tie_weights,
     make_quant,
+    maybe_convert_gptq_v2_to_v1_export,
     streaming_state_dict_to_shards,
 )
 from ..utils.structure import alias_all_from_turtle_if_meta, alias_from_turtle_for_submodule
@@ -764,114 +767,133 @@ def ModelWriter(cls):
                 log.info("Model save: materialized %s remaining meta params from turtle source.", restored_meta)
 
         offload_root = self.quantize_config.offload_to_disk_path if getattr(self.quantize_config, "offload_to_disk", False) else None
-        state_dict = get_state_dict_for_save(self.model, offload_root=offload_root)
-        copy_tensor_files, prefix_entries = _normalize_out_of_model_tensors_entries(
-            getattr(self, "out_of_model_tensors", None)
+        export_converted = maybe_convert_gptq_v2_to_v1_export(
+            self.model,
+            quantize_config,
+            self.qlinear_kernel,
         )
-        if prefix_entries:
-            _merge_prefix_tensors_into_state_dict(prefix_entries, self.model_local_path, state_dict)
-
-        model_base_name = "model"
-        model_save_name = model_base_name + ".safetensors"
-
-        if not self.qlinear_kernel.SUPPORTS_SHARDS and max_shard_size is not None:
-            log.warn("Sharding is not supported for this quant. Disabling sharding.")
-            max_shard_size = None
-
-        def _parse_max_shard_size(value: Optional[Union[int, str]]) -> Optional[int]:
-            if value is None:
-                return None
-            if isinstance(value, int):
-                return value
-            match = _MAX_SHARD_SIZE_RE.fullmatch(value)
-            if not match:
-                raise ValueError(f"Invalid max_shard_size value: {value}")
-            base = int(match.group(1))
-            suffix = match.group(2).upper()
-            multiplier = 1
-            if suffix.startswith("K"):
-                multiplier = 1024
-            elif suffix.startswith("M"):
-                multiplier = 1024 ** 2
-            elif suffix.startswith("G"):
-                multiplier = 1024 ** 3
-            elif suffix.startswith("T"):
-                multiplier = 1024 ** 4
-            elif suffix.startswith("P"):
-                multiplier = 1024 ** 5
-            return base * multiplier
-
-        def _normalize_metadata(meta: Optional[Dict[str, Any]]) -> Dict[str, str]:
-            if meta is None:
-                return {}
-            if not isinstance(meta, dict):
-                raise TypeError("safetensors_metadata must be a dictionary.")
-            normalized: Dict[str, str] = {}
-            for key, value in meta.items():
-                try:
-                    new_key = str(key)
-                    new_value = str(value)
-                except Exception as exc:
-                    raise TypeError(
-                        f"safetensors_metadata: both keys and values must be strings and conversion failed for ({key}, {value}): {exc}"
-                    )
-                if new_key in normalized:
-                    log.warn(
-                        f"Duplicate metadata key '{new_key}' after conversion to string; overwriting previous value."
-                    )
-                normalized[new_key] = new_value
-            return normalized
-
-        max_shard_size_bytes = _parse_max_shard_size(max_shard_size)
-        metadata_dict = _normalize_metadata(safetensors_metadata)
-        metadata_dict["format"] = "pt"
-        split_by_mode = _parse_split_by(split_by)
-
-        if split_by_mode == "layer":
-            expected_files, tensor_to_filename, total_size_bytes = _stream_state_dict_to_layer_dirs(
-                state_dict,
-                save_dir=save_dir,
-                model_base_name="layer",
-                model_save_name="layer.safetensors",
-                metadata=metadata_dict,
-                max_shard_size=max_shard_size_bytes,
-                layer_prefixes=self.extract_layers_node(),
-                model=self.model,
+        try:
+            state_dict = get_state_dict_for_save(self.model, offload_root=offload_root)
+            copy_tensor_files, prefix_entries = _normalize_out_of_model_tensors_entries(
+                getattr(self, "out_of_model_tensors", None)
             )
-        else:
-            expected_files, tensor_to_filename, total_size_bytes = streaming_state_dict_to_shards(
-                state_dict,
-                save_dir=save_dir,
-                model_base_name=model_base_name,
-                single_file_name=model_save_name,
-                metadata=metadata_dict,
-                max_shard_size=max_shard_size_bytes,
-            )
-            _cleanup_saved_weight_files(
-                save_dir=save_dir,
-                expected_files=expected_files,
-                model_base_name=model_base_name,
-                model_save_name=model_save_name,
-            )
+            if prefix_entries:
+                _merge_prefix_tensors_into_state_dict(prefix_entries, self.model_local_path, state_dict)
 
-        total_size_mb = total_size_bytes / (1024 * 1024)
+            model_base_name = "model"
+            model_save_name = model_base_name + ".safetensors"
 
-        if split_by_mode == "layer" or len(expected_files) > 1:
-            index = {
-                "metadata": {"total_size": total_size_bytes},
-                "weight_map": tensor_to_filename,
-            }
-            index_save_name = model_save_name + ".index.json"
-            index_save_path = join(save_dir, index_save_name)
-            with open(index_save_path, "w", encoding="utf-8") as f:
-                content = json.dumps(index, indent=2, sort_keys=True) + "\n"
-                f.write(content)
-        else:
-            index_save_path = join(save_dir, model_save_name + ".index.json")
-            if os.path.exists(index_save_path):
-                os.remove(index_save_path)
+            if not self.qlinear_kernel.SUPPORTS_SHARDS and max_shard_size is not None:
+                log.warn("Sharding is not supported for this quant. Disabling sharding.")
+                max_shard_size = None
 
-        state_dict.clear()
+            def _parse_max_shard_size(value: Optional[Union[int, str]]) -> Optional[int]:
+                if value is None:
+                    return None
+                if isinstance(value, int):
+                    return value
+                match = _MAX_SHARD_SIZE_RE.fullmatch(value)
+                if not match:
+                    raise ValueError(f"Invalid max_shard_size value: {value}")
+                base = int(match.group(1))
+                suffix = match.group(2).upper()
+                multiplier = 1
+                if suffix.startswith("K"):
+                    multiplier = 1024
+                elif suffix.startswith("M"):
+                    multiplier = 1024 ** 2
+                elif suffix.startswith("G"):
+                    multiplier = 1024 ** 3
+                elif suffix.startswith("T"):
+                    multiplier = 1024 ** 4
+                elif suffix.startswith("P"):
+                    multiplier = 1024 ** 5
+                return base * multiplier
+
+            def _normalize_metadata(meta: Optional[Dict[str, Any]]) -> Dict[str, str]:
+                if meta is None:
+                    return {}
+                if not isinstance(meta, dict):
+                    raise TypeError("safetensors_metadata must be a dictionary.")
+                normalized: Dict[str, str] = {}
+                for key, value in meta.items():
+                    try:
+                        new_key = str(key)
+                        new_value = str(value)
+                    except Exception as exc:
+                        raise TypeError(
+                            f"safetensors_metadata: both keys and values must be strings and conversion failed for ({key}, {value}): {exc}"
+                        )
+                    if new_key in normalized:
+                        log.warn(
+                            f"Duplicate metadata key '{new_key}' after conversion to string; overwriting previous value."
+                        )
+                    normalized[new_key] = new_value
+                return normalized
+
+            max_shard_size_bytes = _parse_max_shard_size(max_shard_size)
+            metadata_dict = _normalize_metadata(safetensors_metadata)
+            metadata_dict["format"] = "pt"
+            split_by_mode = _parse_split_by(split_by)
+
+            if split_by_mode == "layer":
+                expected_files, tensor_to_filename, total_size_bytes = _stream_state_dict_to_layer_dirs(
+                    state_dict,
+                    save_dir=save_dir,
+                    model_base_name="layer",
+                    model_save_name="layer.safetensors",
+                    metadata=metadata_dict,
+                    max_shard_size=max_shard_size_bytes,
+                    layer_prefixes=self.extract_layers_node(),
+                    model=self.model,
+                )
+            else:
+                expected_files, tensor_to_filename, total_size_bytes = streaming_state_dict_to_shards(
+                    state_dict,
+                    save_dir=save_dir,
+                    model_base_name=model_base_name,
+                    single_file_name=model_save_name,
+                    metadata=metadata_dict,
+                    max_shard_size=max_shard_size_bytes,
+                )
+                _cleanup_saved_weight_files(
+                    save_dir=save_dir,
+                    expected_files=expected_files,
+                    model_base_name=model_base_name,
+                    model_save_name=model_save_name,
+                )
+
+            total_size_mb = total_size_bytes / (1024 * 1024)
+
+            if split_by_mode == "layer" or len(expected_files) > 1:
+                index = {
+                    "metadata": {"total_size": total_size_bytes},
+                    "weight_map": tensor_to_filename,
+                }
+                index_save_name = model_save_name + ".index.json"
+                index_save_path = join(save_dir, index_save_name)
+                with open(index_save_path, "w", encoding="utf-8") as f:
+                    content = json.dumps(index, indent=2, sort_keys=True) + "\n"
+                    f.write(content)
+            else:
+                index_save_path = join(save_dir, model_save_name + ".index.json")
+                if os.path.exists(index_save_path):
+                    os.remove(index_save_path)
+
+            state_dict.clear()
+        finally:
+            if export_converted:
+                convert_gptq_v1_to_v2_format(
+                    self.model,
+                    cfg=quantize_config,
+                    qlinear_kernel=self.qlinear_kernel,
+                )
+                for module in self.model.modules():
+                    if isinstance(module, BaseQuantLinear):
+                        if hasattr(module, "clear_weight_cache"):
+                            module.clear_weight_cache()
+                        if hasattr(module, "_stream_reset_cache"):
+                            module._stream_reset_cache()
 
         # save lora
         if self.quantize_config.adapter:
