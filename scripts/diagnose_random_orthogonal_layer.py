@@ -79,6 +79,27 @@ def _resolve_module(model: GPTQModel, module_name: str) -> nn.Module:
     return target
 
 
+def _resolve_module_name(model: GPTQModel, module_name: str) -> str:
+    """Return the canonical ``named_modules`` key for ``module_name``."""
+    modules = dict(model.named_modules())
+    if module_name in modules:
+        return module_name
+    candidates = [name for name in modules if name.endswith(module_name)]
+    if len(candidates) == 1:
+        return candidates[0]
+    if candidates:
+        raise SystemExit(
+            f"Ambiguous module {module_name!r}; candidates: {candidates[:5]}"
+        )
+    raise SystemExit(f"Module {module_name!r} not found in model.")
+
+
+def _get_gptq_submodule(model: GPTQModel, module_name: str) -> nn.Module:
+    """Resolve a submodule using GPTQModel ``named_modules`` paths."""
+    resolved = _resolve_module_name(model, module_name)
+    return model.get_submodule(resolved)
+
+
 def _ensure_eager_weights(model: GPTQModel) -> None:
     """Materialize any lazy/meta shells so manual forwards can run."""
     try:
@@ -420,8 +441,12 @@ def run_identity_layer_mse_diag(
 
     fp16_model = GPTQModel.load(model_id, **load_kwargs)
     configure_moe_quantize_config(fp16_model, fp16_model.quantize_config)
-    fp16_module = _resolve_module(fp16_model, module_name)
-    fp16_full_name = next(name for name, mod in fp16_model.named_modules() if mod is fp16_module)
+    fp16_module_name = _resolve_module_name(fp16_model, module_name)
+    fp16_module = _get_gptq_submodule(fp16_model, fp16_module_name)
+    if not isinstance(fp16_module, nn.Linear):
+        raise RuntimeError(
+            f"Expected nn.Linear at {fp16_module_name}, got {type(fp16_module).__name__}"
+        )
     fp16_weight = fp16_module.weight.detach().clone()
     fp16_bias = fp16_module.bias.detach().clone() if fp16_module.bias is not None else None
 
@@ -432,7 +457,7 @@ def run_identity_layer_mse_diag(
         quantize_kwargs["calibration_concat_size"] = calib_concat_size
     quant_model.quantize(calibration, **quantize_kwargs)
 
-    quant_module = quant_model.model.get_submodule(fp16_full_name)
+    quant_module = _get_gptq_submodule(quant_model, fp16_module_name)
     if not isinstance(quant_module, TorchLinear):
         raise RuntimeError(
             f"Expected TorchLinear at {fp16_full_name}, got {type(quant_module).__name__}"
@@ -460,7 +485,7 @@ def run_identity_layer_mse_diag(
     )
 
     return {
-        "module": fp16_full_name,
+        "module": fp16_module_name,
         "device": str(device_obj),
         "kernel": type(quant_module).__name__,
         "identity_layer_mse": mse_stats,

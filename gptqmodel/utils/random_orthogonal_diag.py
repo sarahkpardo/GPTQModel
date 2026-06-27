@@ -183,6 +183,85 @@ def compare_inmem_reload_dequant(
     }
 
 
+def clear_torchlinear_inference_state(model: nn.Module) -> int:
+    """Reset TorchLinear eval caches before inference or dequant comparisons."""
+    from ..nn_modules.qlinear.torch import TorchLinear
+
+    count = 0
+    for module in model.modules():
+        if isinstance(module, TorchLinear):
+            module.clear_weight_cache()
+            if hasattr(module, "_stream_reset_cache"):
+                module._stream_reset_cache()
+            count += 1
+    return count
+
+
+def _eager_torchlinear_dequant(module) -> torch.Tensor:
+    """Dequantize without eval caches or compiled wrappers."""
+    from ..nn_modules.qlinear.torch import TorchLinear
+
+    if not isinstance(module, TorchLinear):
+        raise TypeError(f"Expected TorchLinear, got {type(module)!r}")
+    module.clear_weight_cache()
+    if hasattr(module, "_stream_reset_cache"):
+        module._stream_reset_cache()
+    num_itr = module.g_idx.shape[0] // module.in_features
+    return TorchLinear.__bases__[0].dequantize_weight(module, num_itr=num_itr)
+
+
+@torch.no_grad()
+def compare_inmem_reload_dequant_eager(
+    inmem_model: nn.Module,
+    reloaded_model: nn.Module,
+    **kwargs,
+) -> dict[str, object]:
+    """Like ``compare_inmem_reload_dequant`` but uses eager parent dequant on both sides."""
+    from ..nn_modules.qlinear.torch import TorchLinear
+
+    result = compare_inmem_reload_dequant(inmem_model, reloaded_model, **kwargs)
+    comparisons: list[dict[str, object]] = []
+    inmem_modules = [
+        (name, module)
+        for name, module in inmem_model.named_modules()
+        if isinstance(module, TorchLinear)
+    ]
+    max_modules = kwargs.get("max_modules", 3)
+    rtol = kwargs.get("rtol", 1e-2)
+    atol = kwargs.get("atol", 1e-2)
+
+    for name, inmem_q in inmem_modules[:max_modules]:
+        try:
+            reloaded_q = reloaded_model.get_submodule(name)
+        except (AttributeError, ModuleNotFoundError):
+            continue
+        if not isinstance(reloaded_q, TorchLinear):
+            continue
+        buffers = inmem_q.list_buffers()
+        eval_device = buffers[0].device if buffers else next(inmem_q.parameters()).device
+        reloaded_q = reloaded_q.to(eval_device)
+        w_inmem = _eager_torchlinear_dequant(inmem_q).float().cpu()
+        w_reload = _eager_torchlinear_dequant(reloaded_q).float().cpu()
+        diff = (w_inmem - w_reload).abs()
+        max_abs = float(diff.max().item())
+        mean_abs = float(diff.mean().item())
+        denom = float(w_inmem.abs().mean().clamp(min=1e-6).item())
+        comparisons.append(
+            {
+                "module": name,
+                "max_abs_diff": max_abs,
+                "mean_abs_diff": mean_abs,
+                "mean_rel_diff": mean_abs / denom,
+                "match": bool(torch.allclose(w_inmem, w_reload, rtol=rtol, atol=atol)),
+            }
+        )
+
+    if comparisons:
+        result["eager_comparisons"] = comparisons
+        result["eager_all_match"] = all(bool(row["match"]) for row in comparisons)
+    return result
+
+
 @torch.no_grad()
 def measure_identity_torchlinear_mse(
     fp16_module: nn.Linear,

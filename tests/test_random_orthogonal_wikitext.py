@@ -22,6 +22,7 @@ from gptqmodel.utils.moe_benchmark import benchmark_quantize_load_kwargs, config
 from gptqmodel.utils.random_orthogonal_diag import (  # noqa: E402
     audit_quant_kernel_types,
     compare_inmem_reload_dequant,
+    compare_inmem_reload_dequant_eager,
 )
 from gptqmodel.utils.wikitext_benchmark import (  # noqa: E402
     compute_logits_relative_error,

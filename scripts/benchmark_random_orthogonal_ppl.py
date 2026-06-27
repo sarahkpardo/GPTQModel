@@ -51,7 +51,8 @@ from gptqmodel.utils.moe_benchmark import (  # noqa: E402
 from gptqmodel.utils.random_orthogonal_diag import (  # noqa: E402
     audit_ptq_hooks,
     audit_quant_kernel_types,
-    compare_inmem_reload_dequant,
+    clear_torchlinear_inference_state,
+    compare_inmem_reload_dequant_eager,
     resolve_model_param_dtype,
     summarize_quant_log,
 )
@@ -141,6 +142,9 @@ def _prepare_model_for_ppl_eval(model: GPTQModel, eval_device: torch.device) -> 
             "(quantize finalize leaves modules on CPU)."
         )
         model.to(eval_device)
+    cleared = clear_torchlinear_inference_state(model.model)
+    if cleared:
+        print(f"PPL eval: cleared TorchLinear inference caches on {cleared} module(s).")
     actual = next(model.model.parameters()).device
     print(f"PPL eval device: {actual}")
     return actual
@@ -299,7 +303,7 @@ def _run_method(
     print(f"Reloading checkpoint with backend={reload_backend_label}...")
     reloaded = GPTQModel.load(str(output_dir), **reload_kwargs)
 
-    dequant_parity = compare_inmem_reload_dequant(model.model, reloaded.model)
+    dequant_parity = compare_inmem_reload_dequant_eager(model.model, reloaded.model)
     if not dequant_parity["all_match"]:
         print(f"WARNING: in-memory vs reload dequant mismatch: {dequant_parity['comparisons'][:1]}")
     del model
