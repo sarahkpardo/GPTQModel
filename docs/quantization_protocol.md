@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document proposes a next-generation quantization configuration protocol for `gptqmodel`.
+This document proposes a quantization configuration protocol for `gptqmodel`.
 
 The protocol is designed to be:
 
@@ -26,33 +26,26 @@ The Python and YAML forms below describe the same protocol.
 Python is the ergonomic builder API.
 YAML is the portable serialized form.
 
-
 ## Design Goals
 
 1. One matching system only.
-   Rules match model objects. Stages do not rematch. Actions do not rematch the whole model in normal use.
-
+  Rules match model objects. Stages do not rematch. Actions do not rematch the whole model in normal use.
 2. Keep the common case short.
-   The common case should need only:
-   - `match`
-   - `weight` / `input` / `output` / `kv_cache`
-   - `prepare`
-   - `quantize`
-   - `export`
-
+  The common case should need only:
+  - `match`
+  - `weight` / `input` / `output` / `kv_cache`
+  - `prepare`
+  - `quantize`
+  - `export`
 3. Make overrides readable.
-   A narrower rule should be able to skip quantization, replace defaults, or stop later rules without confusing `+` / `-` syntax.
-
+  A narrower rule should be able to skip quantization, replace defaults, or stop later rules without confusing `+` / `-` syntax.
 4. Make partial overrides cheap.
-   A narrower rule should be able to override only `bits`, `group_size`, or another single leaf field without restating the full quantizer configuration.
-
+  A narrower rule should be able to override only `bits`, `group_size`, or another single leaf field without restating the full quantizer configuration.
 5. Separate quantization from representation.
-   `quantize` answers how quantized values are produced.
+  `quantize` answers how quantized values are produced.
    `export` answers how those values are encoded into final tensors and metadata.
-
 6. Keep backend-specific terms internal.
-   Terms such as `*input_quantizer`, `*weight_quantizer`, or packer-specific tensor names should not be the primary user-facing API.
-
+  Terms such as `*input_quantizer`, `*weight_quantizer`, or packer-specific tensor names should not be the primary user-facing API.
 
 ## Protocol Root
 
@@ -100,7 +93,6 @@ stages:
 A stage is an ordered execution boundary.
 A rule is the only normal matcher.
 Each rule may configure one or more tensor targets.
-
 
 ## Match Selectors
 
@@ -152,7 +144,6 @@ Recommended semantics:
 - every other selector string is interpreted as regex by default
 - for exact module-name matches, use an anchored escaped regex such as `^model\.layers\.0\.self_attn\.q_proj$`
 
-
 ## Internal Implementation
 
 An implementation may compile the user-facing protocol into an internal typed object such as:
@@ -164,7 +155,6 @@ Plan(version=2, stages=[...])
 That internal root object is for parser/runtime organization.
 It should not be required in user-facing examples or config files.
 Normal user configs have one protocol root for one quantization run or artifact, not multiple user-facing plans.
-
 
 ## Authoring Surfaces
 
@@ -200,7 +190,6 @@ weight:
   export:
     format: gptq
 ```
-
 
 ## Stages
 
@@ -265,7 +254,6 @@ stages:
             format: gptq
 ```
 
-
 ## Rules
 
 A `Rule` contains:
@@ -312,7 +300,6 @@ output: {}
 kv_cache: {}
 ```
 
-
 ## Matching
 
 Recommended match forms:
@@ -324,7 +311,6 @@ Recommended match forms:
 Rules are evaluated top-to-bottom inside a stage.
 
 There is no stage-level matcher and no normal action-level global matcher.
-
 
 ## Aliases
 
@@ -368,7 +354,6 @@ actions:
 Use `aliases` only when the same relative subset must be reused.
 If the action naturally operates on the matched object, omit `aliases`.
 
-
 ## Actions
 
 `actions` is a rule-scoped list of operations that run in the context of the rule match.
@@ -396,7 +381,6 @@ This keeps placement clear:
 - SmoothQuant or AWQ-like balancing: `actions`
 - local weight clip / pad / smoother: `weight.prepare`
 
-
 ## Tensor Targets
 
 The protocol supports these first-class tensor targets:
@@ -412,7 +396,6 @@ This makes the protocol future-proof for:
 - activation quantization
 - output quantization
 - cache quantization
-
 
 ## Target Sections
 
@@ -443,7 +426,6 @@ weight:
   export: null
 ```
 
-
 ### `prepare`
 
 `prepare` is for target-local pre-quant transformations.
@@ -465,12 +447,7 @@ Placement rule:
 - cross-target or rule-context modification -> `actions`
 
 **Runtime ordering (GPTQ / Chen et al.):** When `true_sequential` is enabled (default), the
-implementation captures activation statistics for each weight matrix **after** earlier matrices
-in the same layer have been quantized. The pipeline is therefore
-`forward_capture → prepare → quantize → writeback` per module, not a batch statistics pass over
-pristine weights followed by a separate quantize pass. This matches the sequential Hessian
-construction in Chen et al. (2025) Algorithm 1 / QR variant Algorithm 4.
-
+implementation captures activation statistics for each weight matrix **after** earlier matrices in the same layer have been quantized. The pipeline is therefore `forward_capture → prepare → quantize → writeback` per module, not a batch statistics pass over pristine weights followed by a separate quantize pass. This matches the sequential Hessian construction in Chen et al. (2025) Algorithm 1 / QR variant Algorithm 4.
 
 ### `quantize`
 
@@ -514,7 +491,6 @@ weight:
 
 The override changes only `bits`.
 It does not require restating `method`, `sym`, or `group_size`.
-
 
 ### `quantize.fallback`
 
@@ -621,7 +597,7 @@ Fallback should use the quantizer's native solve scope.
 Important separation:
 
 - `quantize.method = gptq` with `fallback.strategy = rtn` means:
-  GPTQ is still the primary method
+GPTQ is still the primary method
 - if the module or group is under-sampled, fallback quantization uses RTN-like weight-only solving
 - the rule's `export` still controls the final encoded representation
 
@@ -688,7 +664,6 @@ This is how fallback should fit into the new protocol:
 - inherited and patchable like other quantizer fields
 - supported only for quantizers that actually depend on calibration / activations
 - independent from `export`
-
 
 ### `export`
 
@@ -771,7 +746,6 @@ Effective result for `small_proj`:
 - `impl = llm_awq`
 - `version = 2`
 
-
 ## Patch-First Override Model
 
 Rules should be treated as patches over an accumulated effective configuration.
@@ -832,7 +806,6 @@ Effective result for `down_proj`:
 
 This is the intended replacement for the current `gptqmodel` dynamic override style where a base rule applies to all modules and narrower matches override only selected fields.
 
-
 ## Advanced Replace Mode
 
 Patch merging should be the default.
@@ -871,7 +844,6 @@ weight:
 
 `mode: replace` is advanced.
 Users should not need it for normal per-layer overrides like changing only `bits`.
-
 
 ## Why `export` Is Separate From `quantize`
 
@@ -950,7 +922,6 @@ W
 So `export` is the correct user-facing property, while internal packing details remain backend implementation details.
 This is also why the canonical `export` form should be an object rather than a string-only enum.
 
-
 ## Activation Quantization
 
 The protocol should expose activation quantization through tensor targets, not backend-internal names.
@@ -999,7 +970,6 @@ Important:
 - `output` means the activation leaving the matched module
 - these are tensor-target concepts, not inserted-submodule names
 
-
 ## Activation-aware GPTQ
 
 If `weight.quantize = gptq(...)` and `input.quantize = ...` coexist, the weight quantizer may need to know whether it should optimize using full-precision or quantized inputs.
@@ -1032,7 +1002,6 @@ Meaning:
 - `"ignore"`: classic weight-only GPTQ
 - `"fake"`: optimize with fake-quantized inputs active
 - `"real"`: reserved for future real low-bit activation flow
-
 
 ## Merge And Override Semantics
 
@@ -1205,7 +1174,6 @@ This means:
 - replace inherited weight config with only the fields given here
 - do not let later rules change `layer0.qkv`
 
-
 ## Execution Semantics
 
 Within a stage, recommended engine order is:
@@ -1221,7 +1189,6 @@ Within a stage, recommended engine order is:
 9. emit stage outputs
 
 Stage order then defines the full pipeline order.
-
 
 ## How Rule Actions And Target Config Work Together
 
@@ -1294,7 +1261,6 @@ Meaning:
 
 The user does not need to add action-level rematching such as `on=[...]` in the normal case.
 The rule already defines the scope.
-
 
 ## Recommended Authoring Patterns
 
@@ -1533,12 +1499,10 @@ YAML:
       variant: gemv
 ```
 
-
 ## Real Test-Derived Examples
 
 The examples below are translations of real repo tests into the proposed protocol.
 They preserve the tested quantization intent, but they do not try to mirror every harness detail such as evaluation tasks, prompt text, or temporary save paths.
-
 
 ### 1. GPTQ with per-module overrides
 
@@ -1628,7 +1592,6 @@ stages:
 This is the clearest example of why the protocol uses patch-first override semantics.
 The narrower rules change only the leaf fields they care about.
 
-
 ### 2. AWQ GEMM full-model quantization
 
 Source tests:
@@ -1695,7 +1658,6 @@ In `tests/test_awq.py`, the same pattern is also exercised with other export var
 - `llm_awq`
 
 That is exactly why `export` needs to be an object and not just a single string token.
-
 
 ### 3. RTN with weight smoothing and AWQ GEMM export
 
@@ -1768,7 +1730,6 @@ Related repo test:
 
 That is a concrete existing example of the protocol's `quantize != export` split.
 
-
 ## Migration From Current `gptqmodel`
 
 Current `gptqmodel` configuration is primarily weight-centric.
@@ -1784,7 +1745,6 @@ A straightforward migration path is:
 
 This keeps current intent while making the protocol ready for activation and cache quantization.
 
-
 ## Non-Goals
 
 The protocol should not make these primary user concepts:
@@ -1793,7 +1753,6 @@ The protocol should not make these primary user concepts:
 - internal packer tensor names
 - stage-level rematching
 - action-level global rematching in normal usage
-
 
 ## Final Shape
 
@@ -1899,3 +1858,4 @@ This keeps the model concise:
 - explicit `quantize`
 - explicit `export`
 - readable override and stop semantics
+
